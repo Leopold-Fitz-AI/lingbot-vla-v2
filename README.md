@@ -156,6 +156,8 @@ The post-training config also enables the Muon optimizer. Muon can produce a bet
 
 For real-world scenarios, see the native-depth training configuration [real_robot.yaml](configs/vla/real_robot/real_robot.yaml). For detailed explanations of batch size, gradient accumulation, checkpointing, depth/video distillation, MoE, and optimizer settings, see [Training_Config.md](configs/vla/Training_Config.md).
 
+The RECAP path now includes causal paired-action collection, a null-preserving signed velocity adapter, compact adapter export/deployment, value-learning utilities, and paired RoboTwin validation; see [docs/recap.md](docs/recap.md).
+
 ## Evaluation and Deployment
 
 ### Open-Loop Evaluation

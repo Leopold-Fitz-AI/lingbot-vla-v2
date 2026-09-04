@@ -176,6 +176,9 @@ class VLADataset(Dataset):
         self.processor = processor
         self.config = config
         self.chunk_size = chunk_size
+        self.precomputed_action_chunks = bool(
+            getattr(dataset_config, "precomputed_action_chunks", False)
+        )
         self.data_name = data_name
         self.disabled_image_features = disabled_image_features
         self.use_depth_align = use_depth_align
@@ -231,7 +234,12 @@ class VLADataset(Dataset):
     def get_delta_timestamps(self, return_indices = False):
         delta_timestamps = {}
         fps = None if return_indices else self.dataset_meta.fps
-        if not len(self.feature_transform.actions_convert_from_state)>0:
+        if self.precomputed_action_chunks:
+            if len(self.feature_transform.actions_convert_from_state) > 0:
+                raise ValueError(
+                    "precomputed_action_chunks is incompatible with actions converted from future states"
+                )
+        elif not len(self.feature_transform.actions_convert_from_state)>0:
             for action_feature in self.feature_transform.org_features['actions']:
                 delta_timestamps[action_feature] = [t / fps if fps else t for t in range(self.chunk_size)]
         else:
@@ -267,6 +275,22 @@ class VLADataset(Dataset):
 
     def getitem(self, idx):
         raw_item = self.check_lerobot_item(self.dataset[idx])
+        if self.precomputed_action_chunks:
+            for action_feature in self.feature_transform.org_features['actions']:
+                action = raw_item[action_feature]
+                if action.ndim != 2 or action.shape[0] != self.chunk_size:
+                    raise ValueError(
+                        f"Precomputed action {action_feature!r} must have shape "
+                        f"[{self.chunk_size}, action_dim], got {tuple(action.shape)}"
+                    )
+                padding_key = f"{action_feature}_is_pad"
+                if padding_key not in raw_item:
+                    raw_item[padding_key] = torch.zeros(self.chunk_size, dtype=torch.bool)
+                elif tuple(raw_item[padding_key].shape) != (self.chunk_size,):
+                    raise ValueError(
+                        f"Precomputed padding mask {padding_key!r} must have shape "
+                        f"[{self.chunk_size}], got {tuple(raw_item[padding_key].shape)}"
+                    )
         if (
             self.use_future_image
             and "future_video_effective_fps" not in raw_item

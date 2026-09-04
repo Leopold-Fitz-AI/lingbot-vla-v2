@@ -33,6 +33,14 @@ from .utils import (
 )
 from .flex_attention import build_block_mask, flex_attention_forward, flex_attention_with_block_mask
 from lingbotvla.models.loader import LingBotVLAWeightLoader
+from lingbotvla.recap.adapter import (
+    apply_recap_velocity_lora,
+    build_recap_condition_embedding,
+)
+from lingbotvla.recap.cfg import (
+    combine_cfg_velocity_batch,
+    duplicate_cfg_denoise_inputs,
+)
 from lingbotvla.ops.triton_moe_loss import triton_sequence_wise_balance_loss
 from lingbotvla.models.vla.lingbot_vla.qwen2_action_expert import (
     Qwen2ForCausalLM,
@@ -127,14 +135,14 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
         vlm_config = AutoConfig.from_pretrained(self.config.tokenizer_path)
         if self.config.vocab_size not in (0, 257152):
             vlm_config.text_config.vocab_size = self.config.vocab_size
-        vlm_config._attn_implementation = "flash_attention_2"
-        vlm_config.text_config._attn_implementation = "flash_attention_2"
+        vlm_config._attn_implementation = self.config.vit_attn_implementation
+        vlm_config.text_config._attn_implementation = self.config.vit_attn_implementation
         vlm_config.vision_config._attn_implementation = self.config.vit_attn_implementation
         self.qwenvl = Qwen3VLForConditionalGeneration._from_config(vlm_config)
         if self.config.use_lm_head:
             self.qwenvl.tie_weights()
 
-        self.config.qwen_expert_config._attn_implementation = "flash_attention_2"
+        self.config.qwen_expert_config._attn_implementation = self.config.vit_attn_implementation
         self.qwen_expert = Qwen2ForCausalLM._from_config(self.config.qwen_expert_config, eval=eval)
 
         if getattr(self.config, "adanorm_time", False):
@@ -475,6 +483,33 @@ class FlowMatchingV2(FlowMatchingV1):
         self.action_time_mlp_in = nn.Linear(self.config.proj_width * 2, self.config.proj_width)
         self.action_time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
 
+        self.recap_adapter_enabled = bool(
+            getattr(self.config, "recap_adapter_enabled", False)
+        )
+        self.recap_adapter_type = str(
+            getattr(self.config, "recap_adapter_type", "embedding")
+        ).lower()
+        if self.recap_adapter_enabled and self.recap_adapter_type == "embedding":
+            # Row 0 is negative and row 1 is positive. The null branch is
+            # constructed as an exact zero vector and has no independent row.
+            self.recap_condition_embeddings = nn.Parameter(
+                torch.zeros(2, self.config.proj_width)
+            )
+        elif self.recap_adapter_enabled and self.recap_adapter_type == "velocity_lora":
+            rank = int(getattr(self.config, "recap_adapter_rank", 8))
+            if rank <= 0:
+                raise ValueError("recap_adapter_rank must be positive")
+            self.recap_velocity_lora_a = nn.Parameter(
+                torch.empty(2, rank, self.config.proj_width)
+            )
+            self.recap_velocity_lora_b = nn.Parameter(
+                torch.zeros(2, self.config.max_action_dim, rank)
+            )
+        elif self.recap_adapter_enabled:
+            raise ValueError(
+                "recap_adapter_type must be 'embedding' or 'velocity_lora'"
+            )
+
         self.config.align_params = getattr(self.config, "align_params", None) or {}
         if self.config.align_params != {}:
             self.steps = 0
@@ -495,6 +530,89 @@ class FlowMatchingV2(FlowMatchingV1):
             self.block_future_depth_to_action = False
 
         self.set_requires_grad()
+
+    def set_requires_grad(self):
+        super().set_requires_grad()
+        if getattr(self.config, "train_recap_adapter_only", False):
+            if not self.recap_adapter_enabled:
+                raise ValueError(
+                    "train_recap_adapter_only requires recap_adapter_enabled"
+                )
+            for parameter in self.parameters():
+                parameter.requires_grad = False
+            if self.recap_adapter_type == "embedding":
+                self.recap_condition_embeddings.requires_grad = True
+            else:
+                self.recap_velocity_lora_a.requires_grad = True
+                self.recap_velocity_lora_b.requires_grad = True
+
+    @torch.no_grad()
+    def reset_recap_adapter(self):
+        if not self.recap_adapter_enabled:
+            raise ValueError("Cannot reset a disabled RECAP adapter")
+        if self.recap_adapter_type == "embedding":
+            self.recap_condition_embeddings.zero_()
+            return
+        # Deterministic non-zero down projections and zero up projections are
+        # the standard LoRA initialization: behavior starts exactly at base,
+        # while the up projection receives gradient on the first step.
+        values = torch.arange(
+            self.recap_velocity_lora_a.numel(),
+            device=self.recap_velocity_lora_a.device,
+            dtype=torch.float32,
+        ).reshape_as(self.recap_velocity_lora_a)
+        init_std = float(getattr(self.config, "recap_adapter_init_std", 0.02))
+        self.recap_velocity_lora_a.copy_(
+            (torch.sin(values * 0.017) * init_std).to(
+                dtype=self.recap_velocity_lora_a.dtype
+            )
+        )
+        self.recap_velocity_lora_b.zero_()
+
+    def _recap_adapter_embedding(self, recap_condition_id, batch_size, device, dtype):
+        return build_recap_condition_embedding(
+            self.recap_condition_embeddings,
+            recap_condition_id,
+            batch_size=batch_size,
+            device=device,
+            dtype=dtype,
+            scale=getattr(self.config, "recap_adapter_scale", 1.0),
+        )
+
+    def embed_suffix(self, state, noisy_actions, timestep, recap_condition_id=None):
+        time_embs, suffix_embs, pad_masks, att_masks = super().embed_suffix(
+            state, noisy_actions, timestep
+        )
+        if self.recap_adapter_enabled and self.recap_adapter_type == "embedding":
+            condition_embedding = self._recap_adapter_embedding(
+                recap_condition_id,
+                batch_size=state.shape[0],
+                device=state.device,
+                dtype=suffix_embs.dtype,
+            )
+            suffix_embs = torch.cat(
+                (
+                    suffix_embs[:, :1],
+                    suffix_embs[:, 1:] + condition_embedding[:, None, :],
+                ),
+                dim=1,
+            )
+        return time_embs, suffix_embs, pad_masks, att_masks
+
+    def _apply_recap_velocity_adapter(
+        self, suffix_out, velocity, recap_condition_id
+    ):
+        if not self.recap_adapter_enabled or self.recap_adapter_type != "velocity_lora":
+            return velocity
+        residual = apply_recap_velocity_lora(
+            suffix_out,
+            recap_condition_id,
+            self.recap_velocity_lora_a,
+            self.recap_velocity_lora_b,
+            scale=getattr(self.config, "recap_adapter_scale", 1.0),
+            signed_axis=getattr(self.config, "recap_signed_velocity_axis", False),
+        )
+        return velocity + residual.to(dtype=velocity.dtype)
 
     def embed_prefix(
         self,
@@ -781,6 +899,7 @@ class FlowMatchingV2(FlowMatchingV1):
         future_video_targets=None,
         future_video_cls_targets=None,
         future_video_current_patch=None,
+        recap_condition_id=None,
     ) -> Tensor:
         dtype = state.dtype
         device = state.device
@@ -808,7 +927,7 @@ class FlowMatchingV2(FlowMatchingV1):
             image_grid_thw=image_grid_thw,
         )
         time_embs, suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
-            state, x_t, time
+            state, x_t, time, recap_condition_id=recap_condition_id
         )
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
@@ -843,7 +962,11 @@ class FlowMatchingV2(FlowMatchingV1):
             deepstack_visual_embeds=deepstack_visual_embeds,
         )
         align_metrics = {}
-        if self.config.align_params != {}:
+        if (
+            self.config.align_params != {}
+            and getattr(self.config, "enable_visual_distillation", True)
+            and depth_targets is not None
+        ):
             loss_depth, loss_future_depth, depth_preds, future_depth_preds = self.depth_emb_forward(outputs_embeds, depth_targets, img_masks,future_depth_targets,)
             loss_depth = loss_depth * self.config.align_params["depth_loss_weight"]
             loss_future_depth = loss_future_depth * self.config.align_params.get("future_depth_loss_weight", 1.0)
@@ -904,6 +1027,9 @@ class FlowMatchingV2(FlowMatchingV1):
             if suffix_out.dtype != self.action_out_proj.weight.dtype:
                 suffix_out = suffix_out.to(self.action_out_proj.weight.dtype)
             v_t = self.action_out_proj(suffix_out)
+        v_t = self._apply_recap_velocity_adapter(
+            suffix_out, v_t, recap_condition_id
+        )
 
         if loss_type == "fm":
             losses = F.mse_loss(u_t, v_t, reduction="none")
@@ -926,11 +1052,63 @@ class FlowMatchingV2(FlowMatchingV1):
         state,
         noise=None,
         image_grid_thw=None,
+        recap_null_lang_tokens=None,
+        recap_null_lang_masks=None,
+        recap_cfg_scale=1.0,
+        recap_condition_id=None,
+        recap_null_condition_id=None,
     ) -> Tensor:
-        """Do a full Qwen3-VL inference forward and compute the action."""
+        """Do a full Qwen3-VL inference forward and compute the action.
+
+        When null language tensors are supplied, the prefix batch is arranged
+        as ``[positive, null]`` and every denoising step combines the paired
+        velocity predictions with advantage-only classifier-free guidance.
+        """
         bsize = state.shape[0]
         device = state.device
         dtype = state.dtype
+        if self.recap_adapter_enabled and recap_condition_id is None:
+            recap_condition_id = torch.full(
+                (bsize,), -1, device=device, dtype=torch.long
+            )
+        cfg_enabled = recap_null_lang_tokens is not None or recap_null_lang_masks is not None
+        if cfg_enabled:
+            if recap_null_lang_tokens is None or recap_null_lang_masks is None:
+                raise ValueError("RECAP CFG requires both null language tokens and masks")
+            if lang_tokens.shape != recap_null_lang_tokens.shape:
+                raise ValueError(
+                    "Positive and null RECAP tokens must have the same padded shape, got "
+                    f"{tuple(lang_tokens.shape)} and {tuple(recap_null_lang_tokens.shape)}"
+                )
+            if lang_masks.shape != recap_null_lang_masks.shape:
+                raise ValueError("Positive and null RECAP language masks must have the same shape")
+            if images.shape[0] != bsize:
+                raise ValueError("RECAP CFG requires an explicit image batch dimension")
+            if img_masks.ndim == 1:
+                img_masks = img_masks.unsqueeze(0)
+            images = torch.cat((images, images), dim=0)
+            img_masks = torch.cat((img_masks, img_masks), dim=0)
+            lang_tokens = torch.cat((lang_tokens, recap_null_lang_tokens), dim=0)
+            lang_masks = torch.cat((lang_masks, recap_null_lang_masks), dim=0)
+            if image_grid_thw is not None:
+                if image_grid_thw.ndim < 3 or image_grid_thw.shape[0] != bsize:
+                    raise ValueError(
+                        "RECAP CFG requires batched image_grid_thw with shape [B, N, 3]"
+                    )
+                image_grid_thw = torch.cat((image_grid_thw, image_grid_thw), dim=0)
+            if self.recap_adapter_enabled:
+                if recap_null_condition_id is None:
+                    recap_null_condition_id = torch.full_like(
+                        torch.as_tensor(recap_condition_id, device=device).reshape(-1),
+                        -1,
+                    )
+                recap_condition_id = torch.cat(
+                    (
+                        torch.as_tensor(recap_condition_id, device=device).reshape(-1),
+                        torch.as_tensor(recap_null_condition_id, device=device).reshape(-1),
+                    ),
+                    dim=0,
+                )
 
         if noise is None:
             actions_shape = (
@@ -986,15 +1164,27 @@ class FlowMatchingV2(FlowMatchingV1):
 
         while time >= -dt / 2:
             count += 1
-            expanded_time = time.expand(bsize)
+            if cfg_enabled:
+                denoise_state, denoise_x_t, expanded_time = duplicate_cfg_denoise_inputs(
+                    state,
+                    x_t,
+                    time,
+                )
+            else:
+                denoise_state = state
+                denoise_x_t = x_t
+                expanded_time = time.expand(bsize)
             v_t = predict_velocity_fn(
-                state,
+                denoise_state,
                 prefix_pad_masks,
                 past_key_values,
-                x_t,
+                denoise_x_t,
                 expanded_time,
                 prefix_position_ids=prefix_position_ids,
+                recap_condition_id=recap_condition_id,
             )
+            if cfg_enabled:
+                v_t = combine_cfg_velocity_batch(v_t, bsize, recap_cfg_scale)
 
             x_t += dt * v_t
             time += dt
@@ -1009,6 +1199,7 @@ class FlowMatchingV2(FlowMatchingV1):
         x_t,
         timestep,
         prefix_position_ids=None,
+        recap_condition_id=None,
     ):
         """Predict velocity at time t using cached Qwen3-VL prefix states."""
         if prefix_position_ids is None:
@@ -1018,6 +1209,7 @@ class FlowMatchingV2(FlowMatchingV1):
             state,
             x_t,
             timestep,
+            recap_condition_id=recap_condition_id,
         )
 
         suffix_len = suffix_pad_masks.shape[1]
@@ -1068,7 +1260,9 @@ class FlowMatchingV2(FlowMatchingV1):
             if suffix_out.dtype != self.action_out_proj.weight.dtype:
                 suffix_out = suffix_out.to(self.action_out_proj.weight.dtype)
             v_t = self.action_out_proj(suffix_out)
-        return v_t
+        return self._apply_recap_velocity_adapter(
+            suffix_out, v_t, recap_condition_id
+        )
 
     def _moe_losses_and_metrics(self, router_logits_list, losses):
         router_z_loss_coeff = getattr(self.config, "router_z_loss_coeff", 0)
@@ -1251,6 +1445,7 @@ class LingbotVlaV2Policy(PreTrainedModel):
         future_video_targets=None,
         future_video_cls_targets=None,
         future_video_current_patch=None,
+        recap_condition_id=None,
         **kwargs
     ) -> tuple[Tensor, dict[str, Tensor]]:
         loss_dict = {}
@@ -1285,6 +1480,7 @@ class LingbotVlaV2Policy(PreTrainedModel):
             future_video_targets=future_video_targets,
             future_video_cls_targets=future_video_cls_targets,
             future_video_current_patch=future_video_current_patch,
+            recap_condition_id=recap_condition_id,
         )
 
         if joint_mask is not None:

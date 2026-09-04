@@ -16,6 +16,8 @@
 #   --start_port        starting port (default: 9330)
 #   --pid_name          PID file prefix (default: test_pid)
 #   --num_tasks         number of sim tasks, taken in order from the task list (default: 50, max: 50)
+#   --tasks             comma-separated explicit task names (overrides --num_tasks)
+#   --test_num          valid episodes per task (default: 100)
 #   --num_gpus          total GPUs (default: 1)
 #   --num_per_gpu       inference servers per GPU (default: 1)
 #   --use_length        chunk length (default: 50)
@@ -25,6 +27,15 @@
 #   --use_bf16          use bfloat16 inference (default: True)
 #   --use_fp32          use float32 inference (default: False)
 #   --use_compile       enable model compile in policy inference (default: True)
+#   --recap_condition   RECAP branch requested from the policy (default: positive)
+#   --recap_adapter_path compact adapter safetensors overlaid on model_path
+#   --recap_cfg_scale   positive-vs-null flow CFG scale (default: 1.0, disabled)
+#   --policy_seed       action-noise seed for the first inference slot (default: 42)
+#   --continuation_policy_seed common non-branch action-noise schedule (default: disabled)
+#   --counterfactual_policy_decision decision index varied by policy_seed (default: 0)
+#   --recap_condition_start_decision first conditioned decision index (default: 0)
+#   --recap_condition_decisions number of conditioned decisions (-1: all after start)
+#   --recap_rollout_dir optional directory for raw RECAP rollout bundles
 #   --keep_inference    keep inference servers resident after simulation
 #
 # Examples:
@@ -48,12 +59,25 @@ conda_sh="${CONDA_SH:-/path/to/miniconda3/etc/profile.d/conda.sh}"
 start_port=9330
 pid_name="test_pid"
 num_tasks=50
+tasks_csv=""
+test_num=100
+seed=0
 num_gpus=1
+gpu_offset=0
 num_per_gpu=1
 use_length=50
 use_bf16=True
 use_fp32=False
 use_compile=True
+recap_condition="positive"
+recap_adapter_path=""
+recap_cfg_scale="1.0"
+policy_seed=42
+continuation_policy_seed=""
+counterfactual_policy_decision=0
+recap_condition_start_decision=0
+recap_condition_decisions=-1
+recap_rollout_dir=""
 robo_name="robotwin"
 video_fps=10
 enable_video=True
@@ -71,11 +95,25 @@ while [[ $# -gt 0 ]]; do
         --start_port)        start_port="$2";        shift 2 ;;
         --pid_name)          pid_name="$2";          shift 2 ;;
         --num_tasks)         num_tasks="$2";         shift 2 ;;
+        --tasks)             tasks_csv="$2";         shift 2 ;;
+        --test_num|--episodes) test_num="$2";        shift 2 ;;
+        --seed)              seed="$2";              shift 2 ;;
         --num_gpus)          num_gpus="$2";          shift 2 ;;
+        --gpu_offset)        gpu_offset="$2";        shift 2 ;;
         --num_per_gpu)       num_per_gpu="$2";       shift 2 ;;
         --use_length)        use_length="$2";        shift 2 ;;
         --use_bf16)          use_bf16="$2";        shift 2 ;;
         --use_fp32)          use_fp32="$2";        shift 2 ;;
+        --use_compile)       use_compile="$2";     shift 2 ;;
+        --recap_condition)   recap_condition="$2"; shift 2 ;;
+        --recap_adapter_path) recap_adapter_path="$2"; shift 2 ;;
+        --recap_cfg_scale)   recap_cfg_scale="$2"; shift 2 ;;
+        --policy_seed)       policy_seed="$2"; shift 2 ;;
+        --continuation_policy_seed) continuation_policy_seed="$2"; shift 2 ;;
+        --counterfactual_policy_decision) counterfactual_policy_decision="$2"; shift 2 ;;
+        --recap_condition_start_decision) recap_condition_start_decision="$2"; shift 2 ;;
+        --recap_condition_decisions) recap_condition_decisions="$2"; shift 2 ;;
+        --recap_rollout_dir) recap_rollout_dir="$2"; shift 2 ;;
         --robo_name)         robo_name="$2";         shift 2 ;;
         --video_fps)         video_fps="$2";         shift 2 ;;
         --no_video)          enable_video=False;     shift ;;
@@ -96,11 +134,25 @@ while [[ $# -gt 0 ]]; do
             echo "  --start_port        starting port (default: 9330)"
             echo "  --pid_name          PID file prefix (default: test_pid)"
             echo "  --num_tasks         number of sim tasks (default: 50, max: 50)"
-            echo "  --num_gpus          total GPUs (default: 1)"
+            echo "  --tasks             comma-separated explicit task names"
+            echo "  --test_num          valid episodes per task (default: 100)"
+            echo "  --seed              RoboTwin seed index (default: 0)"
+            echo "  --num_gpus          total contiguous GPUs (default: 1)"
+            echo "  --gpu_offset        first physical GPU index (default: 0)"
             echo "  --num_per_gpu       inference servers per GPU (default: 1)"
             echo "  --use_length        chunk length (default: 50)"
             echo "  --use_bf16          use bfloat16 inference (default: True)"
             echo "  --use_fp32          use float32 inference (default: False)"
+            echo "  --use_compile       enable model compile in policy inference (default: True)"
+            echo "  --recap_condition   positive, negative, or null (default: positive)"
+            echo "  --recap_adapter_path compact adapter safetensors overlay"
+            echo "  --recap_cfg_scale   positive-vs-null flow CFG scale (default: 1.0)"
+            echo "  --policy_seed       action-noise seed for first inference slot (default: 42)"
+            echo "  --continuation_policy_seed common non-branch noise seed (disabled by default)"
+            echo "  --counterfactual_policy_decision decision index varied by policy_seed (default: 0)"
+            echo "  --recap_condition_start_decision first conditioned decision (default: 0)"
+            echo "  --recap_condition_decisions number conditioned (-1: all after start)"
+            echo "  --recap_rollout_dir save raw rollout bundles to this directory"
             echo "  --robo_name         robot config name (default: robotwin)"
             echo "  --keep_inference    keep inference servers resident after simulation"
             echo "  --video_fps         video recording fps (default: 10)"
@@ -111,6 +163,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+case "$recap_condition" in
+    positive|negative|null) ;;
+    *) echo -e "\033[31mError: --recap_condition must be positive, negative, or null\033[0m"; exit 1 ;;
+esac
+if [ -n "$recap_adapter_path" ] && [ ! -f "$recap_adapter_path" ]; then
+    echo -e "\033[31mError: --recap_adapter_path is not a file: ${recap_adapter_path}\033[0m"
+    exit 1
+fi
 
 # ===== Common environment =====
 # Cleanup: kill all child processes on exit / Ctrl-C / kill
@@ -188,15 +248,50 @@ echo -e "\033[36mSim-side python (${sim_env}): ${sim_python} ($(${sim_python} --
 conda deactivate 2>/dev/null || true
 
 # ===== Task count validation =====
-if [ "$num_tasks" -gt 50 ]; then
+requested_tasks=()
+if [ -n "$tasks_csv" ]; then
+    IFS=',' read -r -a requested_tasks <<< "$tasks_csv"
+    num_tasks=${#requested_tasks[@]}
+fi
+if ! [[ "$num_tasks" =~ ^[1-9][0-9]*$ ]] || [ "$num_tasks" -gt 50 ]; then
     echo -e "\033[31mError: num_tasks ${num_tasks} exceeds max 50; use 1~50\033[0m"
     exit 1
+fi
+if ! [[ "$num_gpus" =~ ^[1-9][0-9]*$ ]] || ! [[ "$gpu_offset" =~ ^[0-9]+$ ]]; then
+    echo -e "\033[31mError: --num_gpus must be positive and --gpu_offset non-negative\033[0m"
+    exit 1
+fi
+if ! [[ "$policy_seed" =~ ^-?[0-9]+$ ]]; then
+    echo -e "\033[31mError: --policy_seed must be an integer\033[0m"
+    exit 1
+fi
+if [ -n "$continuation_policy_seed" ] && ! [[ "$continuation_policy_seed" =~ ^-?[0-9]+$ ]]; then
+    echo -e "\033[31mError: --continuation_policy_seed must be an integer\033[0m"
+    exit 1
+fi
+if ! [[ "$counterfactual_policy_decision" =~ ^[0-9]+$ ]]; then
+    echo -e "\033[31mError: --counterfactual_policy_decision must be non-negative\033[0m"
+    exit 1
+fi
+if ! [[ "$recap_condition_start_decision" =~ ^[0-9]+$ ]]; then
+    echo -e "\033[31mError: --recap_condition_start_decision must be non-negative\033[0m"
+    exit 1
+fi
+if ! [[ "$recap_condition_decisions" =~ ^-?[0-9]+$ ]] || [ "$recap_condition_decisions" -lt -1 ]; then
+    echo -e "\033[31mError: --recap_condition_decisions must be -1 or non-negative\033[0m"
+    exit 1
+fi
+if command -v nvidia-smi >/dev/null 2>&1; then
+    available_gpus=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
+    if [ $((gpu_offset + num_gpus)) -gt "$available_gpus" ]; then
+        echo -e "\033[31mError: GPU range ${gpu_offset}..$((gpu_offset + num_gpus - 1)) exceeds ${available_gpus} visible physical GPUs\033[0m"
+        exit 1
+    fi
 fi
 
 # ===== Sim-side args =====
 policy_name=ACT
 train_config_name=0
-seed=0
 
 # ===== Compute inference slot count =====
 # actual slots = min(num_tasks, num_gpus * num_per_gpu)
@@ -213,11 +308,25 @@ task_list_all=("lift_pot" "hanging_mug" "stack_bowls_three" "scan_object" "hando
 
 # Build the sim task queue
 task_queue=()
-for i in $(seq 0 $((num_tasks-1))); do
-    task_queue+=("${task_list_all[$i]}")
-done
+if [ ${#requested_tasks[@]} -gt 0 ]; then
+    for requested_task in "${requested_tasks[@]}"; do
+        found=false
+        for known_task in "${task_list_all[@]}"; do
+            [ "$requested_task" = "$known_task" ] && found=true && break
+        done
+        if ! $found; then
+            echo -e "\033[31mError: unknown task '${requested_task}'\033[0m"
+            exit 1
+        fi
+        task_queue+=("$requested_task")
+    done
+else
+    for i in $(seq 0 $((num_tasks-1))); do
+        task_queue+=("${task_list_all[$i]}")
+    done
+fi
 echo -e "\033[36mTasks this run (${num_tasks}): ${task_queue[*]}\033[0m"
-echo -e "\033[36mInference config: ${num_gpus} GPU x ${num_per_gpu} servers/GPU = ${num_slots} slots\033[0m"
+echo -e "\033[36mInference config: ${num_gpus} GPU x ${num_per_gpu} servers/GPU = ${num_slots} slots (physical offset ${gpu_offset})\033[0m"
 
 # ===== Common variables =====
 batch_time=$(date +%Y%m%d_%H%M%S)
@@ -227,6 +336,13 @@ _step_num=$(echo "$model_path" | grep -oP 'global_step_\K\d+')
 _step_k=$(( _step_num / 1000 ))k
 run_dir="${output_base}/${_exp_name}_${_step_k}_${task_config}_${batch_time}"
 mkdir -p "${run_dir}/inference_logs" "${run_dir}/eval_logs"
+if [ "$recap_rollout_dir" = "auto" ]; then
+    recap_rollout_dir="${run_dir}/recap_rollouts"
+fi
+if [ -n "$recap_rollout_dir" ]; then
+    mkdir -p "$recap_rollout_dir"
+    echo -e "\033[36mRECAP rollouts: ${recap_rollout_dir}\033[0m"
+fi
 log_dir="${run_dir}"
 inference_pid_file="${run_dir}/inference_pids.txt"
 eval_pid_file="${run_dir}/eval_pids.txt"
@@ -249,8 +365,9 @@ echo -e "\033[32m========== Starting inference side: ${num_slots} QwenPi servers
 cd "$inference_workdir" || { echo -e "\033[31mError: inference workdir ${inference_workdir} missing\033[0m"; exit 1; }
 
 for slot in $(seq 0 $((num_slots-1))); do
-    gpu_id=$(( slot % num_gpus ))
+    gpu_id=$(( gpu_offset + slot % num_gpus ))
     port=$(( start_port + slot ))
+    slot_policy_seed=$(( policy_seed + slot ))
 
     export CUDA_VISIBLE_DEVICES=${gpu_id}
 
@@ -264,11 +381,28 @@ for slot in $(seq 0 $((num_slots-1))); do
         inference_script_for_module="${inference_script_for_module#${inference_workdir%/}/}"
     fi
     inference_module=$(echo "${inference_script_for_module}" | sed 's|/|.|g; s|\.py$||')
+    continuation_seed_arg=""
+    if [ -n "$continuation_policy_seed" ]; then
+        continuation_seed_arg="--continuation_policy_seed '${continuation_policy_seed}'"
+    fi
+    recap_adapter_arg=""
+    if [ -n "$recap_adapter_path" ]; then
+        recap_adapter_arg="--recap_adapter_path '${recap_adapter_path}'"
+    fi
     setsid bash -c "source ${conda_sh} && conda activate ${inference_env} && SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 python -m ${inference_module} \
         --model_path '${model_path}' \
         --use_length '${use_length}' \
         --use_bf16 "${use_bf16}" \
         --use_fp32 "${use_fp32}" \
+        --use_compile "${use_compile}" \
+        --policy_seed '${slot_policy_seed}' \
+        ${continuation_seed_arg} \
+        ${recap_adapter_arg} \
+        --counterfactual_policy_decision '${counterfactual_policy_decision}' \
+        --recap_condition '${recap_condition}' \
+        --recap_condition_start_decision '${recap_condition_start_decision}' \
+        --recap_condition_decisions '${recap_condition_decisions}' \
+        --recap_cfg_scale '${recap_cfg_scale}' \
         --port '${port}'" > "$log_file" 2>&1 &
 
     pid=$!
@@ -303,28 +437,28 @@ cd "$eval_workdir" || { echo -e "\033[31mError: sim workdir ${eval_workdir} miss
 # must live at <RoboTwin>/script/ for _camera_config.yml to be found.
 eval_client_src="${inference_workdir}experiment/robotwin/eval_policy_client_lingbotvla.py"
 eval_client_dst="${eval_workdir}/script/eval_policy_client_lingbotvla.py"
-if [ ! -f "$eval_client_dst" ]; then
-    if [ ! -f "$eval_client_src" ]; then
-        echo -e "\033[31mError: eval client source not found: ${eval_client_src}\033[0m"
-        exit 1
-    fi
-    echo -e "\033[36mCopying eval client -> ${eval_client_dst}\033[0m"
+if [ ! -f "$eval_client_src" ]; then
+    echo -e "\033[31mError: eval client source not found: ${eval_client_src}\033[0m"
+    exit 1
+fi
+if [ ! -f "$eval_client_dst" ] || ! cmp -s "$eval_client_src" "$eval_client_dst"; then
+    echo -e "\033[36mUpdating eval client -> ${eval_client_dst}\033[0m"
     cp "$eval_client_src" "$eval_client_dst"
 fi
 
 # ===== Ensure the deploy client helpers are present under RoboTwin/script/deploy =====
-# The eval client does `from script.deploy.websocket_client_policy import WebsocketClientPolicy`,
-# which pulls in a sibling msgpack_numpy. Copy any that are missing from the inference repo.
+# The eval client imports the WebSocket client and dependency-light RECAP recorder
+# from this package. Keep copied files synchronized with the inference checkout.
 deploy_pkg_src="${inference_workdir}deploy"
 deploy_pkg_dst="${eval_workdir}/script/deploy"
 mkdir -p "$deploy_pkg_dst"
-for f in __init__.py websocket_client_policy.py msgpack_numpy.py; do
-    if [ ! -f "$deploy_pkg_dst/$f" ]; then
-        if [ ! -f "$deploy_pkg_src/$f" ]; then
-            echo -e "\033[31mError: deploy helper source not found: ${deploy_pkg_src}/${f}\033[0m"
-            exit 1
-        fi
-        echo -e "\033[36mCopying deploy helper -> ${deploy_pkg_dst}/${f}\033[0m"
+for f in __init__.py websocket_client_policy.py msgpack_numpy.py recap_rollout_recorder.py; do
+    if [ ! -f "$deploy_pkg_src/$f" ]; then
+        echo -e "\033[31mError: deploy helper source not found: ${deploy_pkg_src}/${f}\033[0m"
+        exit 1
+    fi
+    if [ ! -f "$deploy_pkg_dst/$f" ] || ! cmp -s "$deploy_pkg_src/$f" "$deploy_pkg_dst/$f"; then
+        echo -e "\033[36mUpdating deploy helper -> ${deploy_pkg_dst}/${f}\033[0m"
         cp "$deploy_pkg_src/$f" "$deploy_pkg_dst/$f"
     fi
 done
@@ -386,14 +520,19 @@ done
 launch_task() {
     local slot=$1
     local task_name=$2
-    local gpu_id=$(( slot % num_gpus ))
+    local gpu_id=$(( gpu_offset + slot % num_gpus ))
     local port=$(( start_port + slot ))
+    local slot_policy_seed=$(( policy_seed + slot ))
 
     export CUDA_VISIBLE_DEVICES=${gpu_id}
 
     local log_file="${run_dir}/eval_logs/${task_name}.log"
 
     local attempt=$((task_retries[$task_name]+1))
+    local task_recap_rollout_dir=""
+    if [ -n "$recap_rollout_dir" ]; then
+        task_recap_rollout_dir="${recap_rollout_dir}/attempt-${attempt}"
+    fi
     echo -e "\033[33m  [launch] ${task_name} -> slot $slot (GPU: ${gpu_id}, PORT: ${port}, Log: ${log_file}) [attempt ${attempt}/${max_retries}]\033[0m"
 
     # On retry, append instead of overwriting the failed log; mark this attempt with a banner
@@ -414,17 +553,27 @@ launch_task() {
     PYTHONWARNINGS=ignore::UserWarning \
     XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
     SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 \
-    setsid bash -c "source ${conda_sh} && conda activate ${sim_env} && export PYTHONPATH=\"\$(python -c 'import site;print(site.getsitepackages()[0])')\${PYTHONPATH:+:\$PYTHONPATH}\" && PYTHONUNBUFFERED=1 PYTHONWARNINGS=ignore::UserWarning XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 python -u ${eval_client_dst} --config policy/${policy_name}/deploy_policy.yml \
+    RECAP_POLICY_SEED="${slot_policy_seed}" \
+    RECAP_CONTINUATION_POLICY_SEED="${continuation_policy_seed}" \
+    RECAP_COUNTERFACTUAL_POLICY_DECISION="${counterfactual_policy_decision}" \
+    RECAP_CONDITION_START_DECISION="${recap_condition_start_decision}" \
+    RECAP_CONDITION_DECISIONS="${recap_condition_decisions}" \
+    setsid bash -c "source ${conda_sh} && conda activate ${sim_env} && export PYTHONPATH=\"\$(python -c 'import site;print(site.getsitepackages()[0])')\${PYTHONPATH:+:\$PYTHONPATH}\" && PYTHONUNBUFFERED=1 PYTHONWARNINGS=ignore::UserWarning XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 RECAP_POLICY_SEED='${slot_policy_seed}' RECAP_CONTINUATION_POLICY_SEED='${continuation_policy_seed}' RECAP_COUNTERFACTUAL_POLICY_DECISION='${counterfactual_policy_decision}' RECAP_CONDITION_START_DECISION='${recap_condition_start_decision}' RECAP_CONDITION_DECISIONS='${recap_condition_decisions}' python -u ${eval_client_dst} --config policy/${policy_name}/deploy_policy.yml \
         --overrides \
         --task_name ${task_name} \
         --task_config ${task_config} \
         --train_config_name ${train_config_name} \
         --seed ${seed} \
+        --test_num ${test_num} \
         --policy_name ${policy_name} \
         --port ${port} \
         --robo_name ${robo_name} \
         --video_fps ${video_fps} \
         --eval_video_log ${enable_video} \
+        --recap_condition '${recap_condition}' \
+        --recap_cfg_scale '${recap_cfg_scale}' \
+        --recap_rollout_dir '${task_recap_rollout_dir}' \
+        --recap_run_id 'attempt-${attempt}' \
         --output_dir '${run_dir}/eval_results'" >> "$log_file" 2>&1 &
 
     local pid=$!

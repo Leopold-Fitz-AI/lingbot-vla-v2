@@ -25,9 +25,27 @@ data:
     - effector.position: bounds_99_woclip
   num_workers: 8
   use_future_image: true
+  # RECAP is opt-in. Set true after adding per-frame `recap_label` values
+  # (1=positive, 0=negative, -1=neutral/null) to the LeRobot datasets.
+  recap_enabled: false
+  recap_indicator_key: recap_label
+  recap_missing_condition: positive
+  recap_condition_dropout: 0.1
+  recap_condition_name: Advantage
+  recap_prompt_enabled: true
+  recap_adapter_enabled: false
 
 train:
   output_dir: /path/to/save_ckpt
+  # Safe RECAP adapter defaults; both switches remain off for ordinary training.
+  recap_adapter_enabled: false
+  train_recap_adapter_only: false
+  recap_adapter_type: velocity_lora
+  recap_adapter_rank: 8
+  recap_adapter_scale: 1.0
+  recap_adapter_init_std: 0.02
+  recap_signed_velocity_axis: false
+  reset_recap_adapter: false
   moe_monitor_interval: 1000
   enable_gradient_checkpointing: false # Set to true if GPU memory is insufficient, but this will slow down training.
   precompute_grid_thw: true

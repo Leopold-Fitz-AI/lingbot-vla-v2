@@ -167,7 +167,9 @@ def main(usr_args):
 
     st_seed = 100000 * (1 + seed)
     suc_nums = []
-    test_num = 100
+    test_num = int(usr_args.get("test_num", 100))
+    if test_num <= 0:
+        raise ValueError(f"test_num must be positive, got {test_num}")
     topk = 1
 
     # model = get_model(usr_args)
@@ -212,6 +214,11 @@ def eval_policy(task_name,
                 usr_args = None):
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
+
+    recap_rollout_dir = None if usr_args is None else usr_args.get("recap_rollout_dir")
+    RecapEpisodeRecorder = None
+    if recap_rollout_dir:
+        from script.deploy.recap_rollout_recorder import RecapEpisodeRecorder
 
     expert_check = True
     TASK_ENV.suc = 0
@@ -272,8 +279,48 @@ def eval_policy(task_name,
         TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
         episode_info_list = [episode_info["info"]]
         results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
-        instruction = np.random.choice(results[0][instruction_type])
+        instruction_override = os.environ.get("RECAP_TASK_INSTRUCTION", "").strip()
+        instruction = (
+            instruction_override
+            if instruction_override
+            else np.random.choice(results[0][instruction_type])
+        )
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
+
+        recap_recorder = None
+        if RecapEpisodeRecorder is not None:
+            rollout_root = Path(recap_rollout_dir) / task_name
+            recap_run_id = usr_args.get("recap_run_id", "run")
+            episode_id = f"{task_name}-{recap_run_id}-seed-{now_seed}-episode-{now_id}"
+            recap_recorder = RecapEpisodeRecorder(
+                rollout_root,
+                episode_id=episode_id,
+                task=str(instruction),
+                seed=now_seed,
+                metadata={
+                    "task_name": task_name,
+                    "policy_name": policy_name,
+                    "task_config": args.get("task_config"),
+                    "checkpoint": args.get("ckpt_setting"),
+                    "recap_condition": usr_args.get("recap_condition", "positive"),
+                    "recap_cfg_scale": usr_args.get("recap_cfg_scale", 1.0),
+                    "policy_seed": os.environ.get("RECAP_POLICY_SEED"),
+                    "continuation_policy_seed": os.environ.get(
+                        "RECAP_CONTINUATION_POLICY_SEED"
+                    ),
+                    "counterfactual_policy_decision": os.environ.get(
+                        "RECAP_COUNTERFACTUAL_POLICY_DECISION"
+                    ),
+                    "recap_condition_start_decision": os.environ.get(
+                        "RECAP_CONDITION_START_DECISION"
+                    ),
+                    "recap_condition_decisions": os.environ.get(
+                        "RECAP_CONDITION_DECISIONS"
+                    ),
+                    "instruction_overridden": bool(instruction_override),
+                    "step_limit": TASK_ENV.step_lim,
+                },
+            )
 
         if TASK_ENV.eval_video_path is not None:
             ffmpeg = subprocess.Popen(
@@ -339,8 +386,10 @@ def eval_policy(task_name,
             # ========= debug image =========
 
             # from IPython import embed;embed()
+            env_step_before = int(TASK_ENV.take_action_cnt)
             ret = model.infer(formatted_observation) #(TASK_ENV, model, observation)
             action, latency = ret['action'], ret['server_timing']
+            executed_actions = []
             if len(action.shape) == 2:
                 initial_obs = False
                 for act in action:
@@ -350,16 +399,43 @@ def eval_policy(task_name,
                     else:
                         initial_obs = True
                     TASK_ENV.take_action(act)
+                    executed_actions.append(np.asarray(act).copy())
                     if TASK_ENV.eval_success:
                         succ = True
                         break
             else:
                 TASK_ENV.take_action(action)
+                executed_actions.append(np.asarray(action).copy())
                 if TASK_ENV.eval_success:
                     succ = True
-            
+
+            if recap_recorder is not None:
+                generated_action = np.asarray(action)
+                if executed_actions:
+                    executed_action = np.stack(executed_actions, axis=0)
+                else:
+                    action_dim = generated_action.shape[-1]
+                    executed_action = np.empty((0, action_dim), dtype=generated_action.dtype)
+                recap_recorder.record_step(
+                    formatted_observation,
+                    generated_action,
+                    executed_action,
+                    env_step_before=env_step_before,
+                    env_step_after=int(TASK_ENV.take_action_cnt),
+                    terminated=succ,
+                    truncated=(not succ and TASK_ENV.take_action_cnt >= TASK_ENV.step_lim),
+                    info={"server_latency": latency},
+                )
+
             print(f"infer time {latency}")
 
+
+        if recap_recorder is not None:
+            recap_recorder.finalize(
+                success=succ,
+                terminal_reason="success" if succ else "step_limit",
+                metadata={"environment_steps": int(TASK_ENV.take_action_cnt)},
+            )
 
         # task_total_reward += TASK_ENV.episode_score
         if TASK_ENV.eval_video_path is not None:

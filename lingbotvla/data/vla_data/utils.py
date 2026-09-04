@@ -10,6 +10,12 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Literal
 import ast
 import torch.nn.functional as F
 
+from ...recap.conditioning import (
+    format_recap_prompt,
+    maybe_drop_recap_condition,
+    normalize_recap_condition,
+    recap_condition_id,
+)
 from ...utils import logging as logging_utils
 from .transform import Normalizer, prepare_images, prepare_state, prepare_language, prepare_action, expert_visual_transform
 from .ee_pose_transform import *
@@ -108,6 +114,36 @@ class FeatureTransform:
         self.use_depth_align = use_depth_align
         self.use_future_image = use_future_image
 
+        # RECAP uses the same language path as ordinary task prompting.  It is
+        # disabled by default so existing checkpoints and datasets are bitwise
+        # compatible with the previous prompt format.
+        self.recap_enabled = bool(getattr(data_config, "recap_enabled", False))
+        self.recap_indicator_key = str(
+            getattr(data_config, "recap_indicator_key", "recap_label")
+        )
+        self.recap_missing_condition = str(
+            getattr(data_config, "recap_missing_condition", "positive")
+        )
+        self.recap_condition_dropout = float(
+            getattr(data_config, "recap_condition_dropout", 0.1)
+        )
+        if not 0.0 <= self.recap_condition_dropout <= 1.0:
+            raise ValueError(
+                "data.recap_condition_dropout must be in [0, 1], got "
+                f"{self.recap_condition_dropout}"
+            )
+        self.recap_condition_name = str(
+            getattr(data_config, "recap_condition_name", "Advantage")
+        )
+        self.recap_prompt_enabled = bool(
+            getattr(data_config, "recap_prompt_enabled", True)
+        )
+        self.recap_adapter_enabled = bool(
+            getattr(data_config, "recap_adapter_enabled", False)
+        )
+        if self.recap_adapter_enabled and not self.recap_enabled:
+            raise ValueError("data.recap_adapter_enabled requires data.recap_enabled")
+
         if not disabled_image_features:
             self.image_augment = image_augment
         
@@ -120,6 +156,8 @@ class FeatureTransform:
             'action_is_pad',
             'task',
         ])
+        if self.recap_enabled:
+            self.feature_to_keep.add(self.recap_indicator_key)
 
         target_features  = {'states':[], 'actions':[], 'images':[]}
         org_features  = {'states':set(), 'actions':set(), 'images':set()}
@@ -371,6 +409,38 @@ class FeatureTransform:
         del item
         return out_item
 
+    def resolve_recap_condition(self, item, policy_eval=False):
+        """Resolve the effective condition once so prompt and adapter stay aligned."""
+
+        if not self.recap_enabled:
+            return None
+        condition = normalize_recap_condition(
+            item.get(self.recap_indicator_key),
+            missing=self.recap_missing_condition,
+        )
+        if not policy_eval:
+            condition = maybe_drop_recap_condition(
+                condition,
+                self.recap_condition_dropout,
+                random_fn=lambda: torch.rand(()).item(),
+            )
+        return condition
+
+    def build_task_prompt(self, item, policy_eval=False, condition=None):
+        """Build a task prompt with an optional RECAP advantage condition."""
+
+        task = item["task"]
+        if not self.recap_enabled:
+            return task
+        if condition is None:
+            condition = self.resolve_recap_condition(item, policy_eval=policy_eval)
+        if not getattr(self, "recap_prompt_enabled", True):
+            return task
+        return format_recap_prompt(
+            task,
+            condition,
+            condition_name=self.recap_condition_name,
+        )
 
     def apply(self, item, policy_eval=False):
         w_action = not policy_eval
@@ -403,7 +473,7 @@ class FeatureTransform:
         if self.return_item_befor_padding:
             return item
 
-        batch_dict = self.pad_and_concat(item, w_action)
+        batch_dict = self.pad_and_concat(item, w_action, policy_eval=policy_eval)
 
         state = prepare_state(batch_dict, self.model_config.max_state_dim) 
         actions = prepare_action(batch_dict, self.model_config.max_action_dim)
@@ -459,6 +529,7 @@ class FeatureTransform:
         action_joint_mask = batch_dict['action_joint_mask']
         assert self.model_config.max_action_dim >= action_joint_mask.shape[-1], f"max_action_dim is smaller than the action joint dimension: {self.model_config.max_action_dim} < {action_joint_mask.shape[-1]}"
         action_joint_mask = F.pad(action_joint_mask, (0, self.model_config.max_action_dim - action_joint_mask.shape[-1])).to(dtype=torch.bool)
+        recap_condition_id_value = batch_dict.get("recap_condition_id")
         
         chunk_joint_mask = batch_dict['chunk_joint_mask']
         assert self.model_config.max_action_dim >= chunk_joint_mask.shape[-1], f"max_action_dim is smaller than the action joint dimension: {self.model_config.max_action_dim} < {chunk_joint_mask.shape[-1]}"
@@ -479,6 +550,8 @@ class FeatureTransform:
             }
         if image_grid_thw is not None:
             batch_dict['image_grid_thw'] = image_grid_thw
+        if recap_condition_id_value is not None:
+            batch_dict["recap_condition_id"] = recap_condition_id_value
 
         if self.use_depth_align: 
             batch_dict['pil_images'] = pil_images
@@ -543,9 +616,15 @@ class FeatureTransform:
             del action_key
         return reverse_item
 
-    def pad_and_concat(self, item, w_action = True):
+    def pad_and_concat(self, item, w_action=True, policy_eval=False):
         images = {}
         future_images = {}
+        recap_condition = self.resolve_recap_condition(item, policy_eval=policy_eval)
+        prompt = self.build_task_prompt(
+            item,
+            policy_eval=policy_eval,
+            condition=recap_condition,
+        )
 
         def _to_uint8(img):
             # Keep images in uint8 [0, 255] before the Qwen-VL image processor, whose
@@ -619,8 +698,13 @@ class FeatureTransform:
             'chunk_joint_mask': chunk_joint_mask,
             "action_joint_mask": action_joint_mask,
             "state_joint_mask": state_joint_mask,
-            "prompt": [item["task"]],
+            "prompt": [prompt],
         }
+        if self.recap_adapter_enabled:
+            batch_dict["recap_condition_id"] = torch.tensor(
+                recap_condition_id(recap_condition),
+                dtype=torch.long,
+            )
         if "future_video_effective_fps" in item:
             batch_dict["future_video_effective_fps"] = item["future_video_effective_fps"]
 

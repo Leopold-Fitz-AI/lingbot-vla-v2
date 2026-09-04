@@ -57,6 +57,13 @@ robot configs, and normalization statistics, see
 | `data.norm_stats_file` | Optional[str] | `None` | Path to the normalization stats JSON file. |
 | `data.prompt_type` | `"global"`, `"subtask"` | `"global"` | Prompt type used by the VLA dataset. Current RoboTwin config uses `"global"`. |
 | `data.use_future_image` | bool | `False` | Whether to load future image frames for native-depth/future-video training. |
+| `data.recap_enabled` | bool | `False` | Enable RECAP positive/negative/null policy conditioning. Disabled preserves the original task prompt exactly. |
+| `data.recap_indicator_key` | str | `"recap_label"` | Per-frame LeRobot column containing `1` (positive), `0` (negative), or `-1` (neutral/null). |
+| `data.recap_missing_condition` | `"positive"`, `"negative"`, `"null"`, `"error"` | `"positive"` | Condition used when a dataset has no indicator column. The default treats legacy expert demonstrations as positive. |
+| `data.recap_condition_dropout` | float | `0.1` | Probability of dropping a positive/negative condition during training to learn the unconditional branch. Disabled during policy evaluation. |
+| `data.recap_condition_name` | str | `"Advantage"` | Text label prepended to the task prompt, for example `Advantage: positive.`. |
+| `data.recap_prompt_enabled` | bool | `True` | Encode the condition in text. Disable for a null-preserving explicit adapter. |
+| `data.recap_adapter_enabled` | bool | `False` | Emit the numeric condition ID consumed by the model adapter. |
 | `data.img_size` | int | `256` | Image size used by VLA data utilities. |
 | `data.state_norm_type` | str | `"none"` | Normalization type for VLA state features. Use `"none"` to reuse `norm_type`; use `"sincos"` to encode raw state angles as cos/sin while actions still use `norm_type`. |
 | `data.image_augment` | bool | `False` | Enable training-time image augmentation for VLA datasets. Random color parameters are sampled once per sample and replayed across all camera views. |
@@ -103,6 +110,14 @@ robot configs, and normalization statistics, see
 | `train.vit_lr` | float | `1e-6` | Maximum learning rate for ViT parameters. |
 | `train.freeze_vision_encoder` | bool | `False` | Whether to freeze the vision encoder. |
 | `train.train_expert_only` | bool | `False` | Whether to train only the action expert. |
+| `train.train_recap_adapter_only` | bool | `False` | Freeze all base-policy tensors and train only RECAP adapter parameters. |
+| `train.recap_adapter_enabled` | bool | `False` | Instantiate an explicit RECAP adapter. |
+| `train.recap_adapter_type` | `"embedding"`, `"velocity_lora"` | `"embedding"` | Inject a token embedding or a low-rank residual directly into flow velocity. |
+| `train.recap_adapter_rank` | int | `8` | Rank of each condition-specific velocity adapter. |
+| `train.recap_adapter_scale` | float | `1.0` | Scale of the adapter residual. |
+| `train.recap_adapter_init_std` | float | `0.02` | Deterministic velocity-LoRA down-projection initialization scale. |
+| `train.recap_signed_velocity_axis` | bool | `False` | Use the positive residual for positive and its exact inverse for negative; null remains zero. Train this mode with causal-positive samples only. |
+| `train.reset_recap_adapter` | bool | `False` | Reinitialize a newly added adapter after loading base weights. |
 | `train.train_state_proj` | bool | `True` | Whether to train the state projection. |
 | `train.tokenizer_max_length` | int | `48` | Maximum tokenizer length. Current V2 configs often set `72`. |
 | `train.action_dim` | int | `7` | Action dimension. |

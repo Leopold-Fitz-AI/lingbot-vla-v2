@@ -1224,7 +1224,11 @@ class FlowMatching(nn.Module):
             fill_kv_cache=True,
             ada_cond = time_embs if getattr(self.config, 'adanorm_time', False) else None,
         )
-        if self.config.align_params != {}:
+        if (
+            self.config.align_params != {}
+            and getattr(self.config, "enable_visual_distillation", True)
+            and depth_targets is not None
+        ):
             loss_depth, depth_preds = self.depth_emb_forward(outputs_embeds, depth_targets, img_masks)
             loss_depth = loss_depth * self.config.align_params['depth_loss_weight']
             self.steps+=1

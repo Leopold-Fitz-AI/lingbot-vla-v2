@@ -31,6 +31,7 @@ from lingbotvla.models.vla.lingbot_vla.qwen3vl_in_vla import apply_lingbot_qwen3
 
 from lingbotvla.data.vla_data.utils import FeatureTransform
 from lingbotvla.models import build_processor
+from lingbotvla.recap.conditioning import normalize_recap_condition
 import time
 import random
 
@@ -83,6 +84,11 @@ class PolicyPreprocessMixin:
             observation['lang_masks'].unsqueeze(0).to(device=device),
             observation['state'].unsqueeze(0).to(dtype=dtype, device=device),
             image_grid_thw=self._to_device_image_grid_thw(observation.get('image_grid_thw'), device),
+            recap_condition_id=(
+                None
+                if observation.get("recap_condition_id") is None
+                else observation["recap_condition_id"].reshape(-1).to(device=device)
+            ),
         )
         delta_time = time.time() - s1
         print(f'sample_actions cost {delta_time} s')
@@ -100,6 +106,7 @@ class PolicyPreprocessMixin:
         use_compile: bool = False,
         capture_time: bool = False,
         sample_compile_fn: callable = None,
+        recap_cfg_scale: float = 1.0,
     ) -> Tensor:
         """Run one model forward for a batch of already-transformed observations.
 
@@ -120,6 +127,10 @@ class PolicyPreprocessMixin:
         lang_masks = observation["lang_masks"]
         state = observation["state"]
         image_grid_thw = observation.get("image_grid_thw", None)
+        recap_null_lang_tokens = observation.get("recap_null_lang_tokens")
+        recap_null_lang_masks = observation.get("recap_null_lang_masks")
+        recap_condition_id = observation.get("recap_condition_id")
+        recap_null_condition_id = observation.get("recap_null_condition_id")
 
         has_batch_dim = img_masks.ndim >= 2
         if not has_batch_dim:
@@ -130,6 +141,33 @@ class PolicyPreprocessMixin:
             lang_masks = lang_masks.unsqueeze(0)
         if state.ndim == 1:
             state = state.unsqueeze(0)
+        if recap_null_lang_tokens is not None and recap_null_lang_tokens.ndim == 1:
+            recap_null_lang_tokens = recap_null_lang_tokens.unsqueeze(0)
+            recap_null_lang_masks = recap_null_lang_masks.unsqueeze(0)
+        sample_kwargs = {
+            "image_grid_thw": self._to_device_image_grid_thw(image_grid_thw, device),
+            "recap_null_lang_tokens": (
+                None
+                if recap_null_lang_tokens is None
+                else recap_null_lang_tokens.to(device=device)
+            ),
+            "recap_null_lang_masks": (
+                None
+                if recap_null_lang_masks is None
+                else recap_null_lang_masks.to(device=device)
+            ),
+            "recap_cfg_scale": float(recap_cfg_scale),
+            "recap_condition_id": (
+                None
+                if recap_condition_id is None
+                else recap_condition_id.reshape(-1).to(device=device)
+            ),
+            "recap_null_condition_id": (
+                None
+                if recap_null_condition_id is None
+                else recap_null_condition_id.reshape(-1).to(device=device)
+            ),
+        }
 
         if capture_time:
             with torch.inference_mode():
@@ -140,7 +178,7 @@ class PolicyPreprocessMixin:
                             lang_tokens.to(device=device),
                             lang_masks.to(device=device),
                             state.to(dtype=dtype, device=device),
-                            image_grid_thw=self._to_device_image_grid_thw(image_grid_thw, device),
+                            **sample_kwargs,
                     )
                 torch.cuda.synchronize()
 
@@ -155,7 +193,7 @@ class PolicyPreprocessMixin:
                                     lang_tokens.to(device=device),
                                     lang_masks.to(device=device),
                                     state.to(dtype=dtype, device=device),
-                                    image_grid_thw=self._to_device_image_grid_thw(image_grid_thw, device),
+                                    **sample_kwargs,
                     )
                     ends[i].record()
                 torch.cuda.synchronize()
@@ -168,7 +206,7 @@ class PolicyPreprocessMixin:
                             lang_tokens.to(device=device),
                             lang_masks.to(device=device),
                             state.to(dtype=dtype, device=device),
-                            image_grid_thw=self._to_device_image_grid_thw(image_grid_thw, device),
+                            **sample_kwargs,
             )
 
         delta_time = time.time() - s1
@@ -196,6 +234,14 @@ class LingbotVLAv2Server:
         use_bf16=True,
         use_fp32=False,
         use_compile=False,
+        recap_condition="positive",
+        recap_cfg_scale=1.0,
+        recap_condition_decisions=-1,
+        recap_condition_start_decision=0,
+        policy_seed=42,
+        continuation_policy_seed=None,
+        counterfactual_policy_decision=0,
+        recap_adapter_path=None,
     ) -> None:
         assert not (use_bf16 and use_fp32), 'Bfloat16 or Float32!!!'
         self.adaptive_ensemble_alpha = adaptive_ensemble_alpha
@@ -203,9 +249,40 @@ class LingbotVLAv2Server:
         self.use_length = use_length
         self.chunk_ret = chunk_ret
         self.robot_norm_path = robot_norm_path
+        self.recap_condition = normalize_recap_condition(recap_condition).value
+        self.recap_cfg_scale = float(recap_cfg_scale)
+        self.recap_condition_decisions = int(recap_condition_decisions)
+        self.recap_condition_start_decision = int(recap_condition_start_decision)
+        if self.recap_condition_start_decision < 0:
+            raise ValueError("recap_condition_start_decision must be non-negative")
+        self.policy_seed = int(policy_seed)
+        self.continuation_policy_seed = (
+            None
+            if continuation_policy_seed is None
+            else int(continuation_policy_seed)
+        )
+        self.counterfactual_policy_decision = int(counterfactual_policy_decision)
+        if self.counterfactual_policy_decision < 0:
+            raise ValueError("counterfactual_policy_decision must be non-negative")
+        if self.recap_condition_decisions < -1:
+            raise ValueError("recap_condition_decisions must be -1 or non-negative")
+        if not np.isfinite(self.recap_cfg_scale) or self.recap_cfg_scale < 0:
+            raise ValueError("recap_cfg_scale must be finite and non-negative")
+        if self.recap_cfg_scale != 1.0 and self.recap_condition != "positive":
+            raise ValueError("RECAP CFG is defined between positive and null conditions")
 
         self.task_description = None
+        self.recap_adapter_path = (
+            None if recap_adapter_path is None else Path(recap_adapter_path)
+        )
+        if self.recap_adapter_path is not None and not self.recap_adapter_path.is_file():
+            raise FileNotFoundError(
+                f"RECAP adapter artifact does not exist: {self.recap_adapter_path}"
+            )
 
+        if self.recap_cfg_scale != 1.0 and use_compile:
+            print("RECAP CFG currently uses eager inference; disabling torch.compile for correctness.")
+            use_compile = False
         self.use_compile = use_compile
         apply_lingbot_qwen3_vl_patch()
 
@@ -232,7 +309,48 @@ class LingbotVLAv2Server:
             with safe_open(file_path, framework="pt", device="cpu") as f:
                 for key in f.keys():
                     merged_weights[key] = f.get_tensor(key)
-        self.vla.load_state_dict(merged_weights, strict=strict)
+        return self.vla.load_state_dict(merged_weights, strict=strict)
+
+    def load_recap_adapter_weights(self):
+        if self.recap_adapter_path is None:
+            return
+        adapter_weights = {}
+        with safe_open(self.recap_adapter_path, framework="pt", device="cpu") as f:
+            metadata = f.metadata() or {}
+            for key in f.keys():
+                if not any(part.startswith("recap_") for part in key.split(".")):
+                    raise ValueError(
+                        f"Non-RECAP tensor {key!r} found in adapter artifact"
+                    )
+                adapter_weights[key] = f.get_tensor(key)
+        expected = {
+            key
+            for key in self.vla.state_dict()
+            if any(part.startswith("recap_") for part in key.split("."))
+        }
+        if set(adapter_weights) != expected:
+            raise ValueError(
+                "Adapter tensor names do not match configured architecture: "
+                f"missing={sorted(expected - set(adapter_weights))}, "
+                f"unexpected={sorted(set(adapter_weights) - expected)}"
+            )
+        artifact_signed = metadata.get("signed_velocity_axis")
+        configured_signed = bool(
+            getattr(self.config, "recap_signed_velocity_axis", False)
+        )
+        if artifact_signed is not None and (artifact_signed == "true") != configured_signed:
+            raise ValueError(
+                "Adapter signed_velocity_axis metadata does not match model config"
+            )
+        result = self.vla.load_state_dict(adapter_weights, strict=False)
+        if result.unexpected_keys:
+            raise ValueError(
+                f"Unexpected adapter tensor(s): {result.unexpected_keys}"
+            )
+        print(
+            f"Loaded compact RECAP adapter: {self.recap_adapter_path}",
+            flush=True,
+        )
 
     def merge_qwen_config(self, qwen_config):
         if hasattr(qwen_config, 'to_dict'):
@@ -317,7 +435,23 @@ class LingbotVLAv2Server:
 
         self.vla = LingBotVlaV2InferencePolicy(config, eval=True)
 
-        self.load_model_weights(path_to_pi_model, strict=True)
+        load_result = self.load_model_weights(
+            path_to_pi_model,
+            strict=self.recap_adapter_path is None,
+        )
+        if self.recap_adapter_path is not None:
+            non_recap_missing = [
+                key
+                for key in load_result.missing_keys
+                if not any(part.startswith("recap_") for part in key.split("."))
+            ]
+            if non_recap_missing or load_result.unexpected_keys:
+                raise ValueError(
+                    "Base checkpoint is incompatible with adapter architecture: "
+                    f"missing={non_recap_missing}, "
+                    f"unexpected={load_result.unexpected_keys}"
+                )
+            self.load_recap_adapter_weights()
         
         self.vla.feature_transform = None
         self.data_config = data_config
@@ -398,9 +532,20 @@ class LingbotVLAv2Server:
 
         return action_chunk
 
-    def _prepare_model_input(self, observation):
+    def _prepare_model_input(self, observation, recap_condition=None):
         # not modify input observation
         observation = dict(observation)
+        feature_transform = self.vla.feature_transform
+        if feature_transform.recap_enabled:
+            if recap_condition is None:
+                observation.setdefault(
+                    feature_transform.recap_indicator_key,
+                    self.recap_condition,
+                )
+            else:
+                observation[feature_transform.recap_indicator_key] = normalize_recap_condition(
+                    recap_condition
+                ).value
         self.resize_image(observation)
         for k, v in list(observation.items()):
             if isinstance(v, np.ndarray):
@@ -435,7 +580,22 @@ class LingbotVLAv2Server:
     def _infer_batch(self, observations, return_normalized=False):
         if not isinstance(observations, (list, tuple)) or len(observations) == 0:
             raise ValueError("batch observation must be a non-empty list")
-        applied = [self._prepare_model_input(obs) for obs in observations] # bsize, dict{key }
+        condition_offset = self.global_step - self.recap_condition_start_decision
+        condition_active = condition_offset >= 0 and (
+            self.recap_condition_decisions == -1
+            or condition_offset < self.recap_condition_decisions
+        )
+        effective_condition = self.recap_condition if condition_active else "null"
+        cfg_active = self.recap_cfg_scale != 1.0 and condition_active
+        if cfg_active and not self.vla.feature_transform.recap_enabled:
+            raise ValueError("RECAP CFG requires a checkpoint trained with data.recap_enabled=true")
+        applied = [
+            self._prepare_model_input(
+                obs,
+                recap_condition="positive" if cfg_active else effective_condition,
+            )
+            for obs in observations
+        ] # bsize, dict{key }
         batch_observation = {}
         for key in applied[0].keys():
             values = [item[key] for item in applied]
@@ -444,6 +604,38 @@ class LingbotVLAv2Server:
                 batch_observation[key] = self._pad_and_stack_tensors(values)
             else:
                 batch_observation[key] = values
+        if cfg_active:
+            null_applied = [
+                self._prepare_model_input(obs, recap_condition="null")
+                for obs in observations
+            ]
+            batch_observation["recap_null_lang_tokens"] = self._pad_and_stack_tensors(
+                [item["lang_tokens"] for item in null_applied]
+            )
+            batch_observation["recap_null_lang_masks"] = self._pad_and_stack_tensors(
+                [item["lang_masks"] for item in null_applied]
+            )
+            if "recap_condition_id" in null_applied[0]:
+                batch_observation["recap_null_condition_id"] = self._pad_and_stack_tensors(
+                    [item["recap_condition_id"] for item in null_applied]
+                )
+            if (
+                batch_observation["lang_tokens"].shape
+                != batch_observation["recap_null_lang_tokens"].shape
+            ):
+                raise ValueError("RECAP positive and null prompts must use equal padded token lengths")
+
+        if self.continuation_policy_seed is not None:
+            # Counterfactual collection varies only one sampled action.
+            # Every branch otherwise shares the same per-decision noise schedule,
+            # removing future policy noise as an outcome confounder.
+            action_seed = (
+                self.policy_seed
+                if self.global_step == self.counterfactual_policy_decision
+                else self.continuation_policy_seed + self.global_step
+            )
+            torch.manual_seed(action_seed)
+            torch.cuda.manual_seed_all(action_seed)
 
         actions = self.vla.sample_actions_batch(
             batch_observation,
@@ -451,6 +643,7 @@ class LingbotVLAv2Server:
             self.use_compile,
             capture_time=False,
             sample_compile_fn = self.sample_actions_fn,
+            recap_cfg_scale=self.recap_cfg_scale,
         )
         
         unnormalized_actions = self._unapply_batched_actions(applied, actions)
@@ -589,8 +782,58 @@ def main():
         type=str2bool,
         default=True,
     )
+    parser.add_argument(
+        "--policy_seed",
+        type=int,
+        default=42,
+        help="Torch/NumPy seed controlling flow-matching action noise.",
+    )
+    parser.add_argument(
+        "--continuation_policy_seed",
+        type=int,
+        default=None,
+        help="Common per-decision noise schedule after the first counterfactual action.",
+    )
+    parser.add_argument(
+        "--counterfactual_policy_decision",
+        type=int,
+        default=0,
+        help="Decision index whose action noise uses policy_seed during counterfactual collection.",
+    )
+    parser.add_argument(
+        "--recap_adapter_path",
+        default=None,
+        help="Optional compact RECAP safetensors artifact overlaid on the base checkpoint.",
+    )
+    parser.add_argument(
+        "--recap_condition",
+        choices=("positive", "negative", "null"),
+        default="positive",
+        help="RECAP policy branch used when an observation does not override the condition.",
+    )
+    parser.add_argument(
+        "--recap_cfg_scale",
+        type=float,
+        default=1.0,
+        help="Positive-vs-null flow velocity CFG scale; 1.0 uses only the positive branch.",
+    )
+    parser.add_argument(
+        "--recap_condition_start_decision",
+        type=int,
+        default=0,
+        help="First policy decision where the requested RECAP condition is active.",
+    )
+    parser.add_argument(
+        "--recap_condition_decisions",
+        type=int,
+        default=-1,
+        help="Apply the requested condition for only the first N policy decisions; -1 means all.",
+    )
 
     args = parser.parse_args()
+    # Reset after argument parsing so separate runs can sample different action
+    # trajectories from the same deterministic RoboTwin initial state.
+    set_seed_everywhere(args.policy_seed)
 
     model = LingbotVLAv2Server(
         args.model_path,
@@ -599,6 +842,14 @@ def main():
         use_bf16=args.use_bf16,
         use_fp32=args.use_fp32,
         use_compile=args.use_compile,
+        recap_condition=args.recap_condition,
+        recap_cfg_scale=args.recap_cfg_scale,
+        recap_condition_decisions=args.recap_condition_decisions,
+        recap_condition_start_decision=args.recap_condition_start_decision,
+        policy_seed=args.policy_seed,
+        continuation_policy_seed=args.continuation_policy_seed,
+        counterfactual_policy_decision=args.counterfactual_policy_decision,
+        recap_adapter_path=args.recap_adapter_path,
     )
     model_server = WebsocketPolicyServer(model, port=args.port)
     model_server.serve_forever()

@@ -92,6 +92,13 @@ class LingbotVLAConfig(PretrainedConfig):
 
         train_expert_only: bool = False,
         train_state_proj: bool = True,
+        recap_adapter_enabled: bool = False,
+        train_recap_adapter_only: bool = False,
+        recap_adapter_type: str = "embedding",
+        recap_adapter_rank: int = 8,
+        recap_adapter_scale: float = 1.0,
+        recap_adapter_init_std: float = 0.02,
+        recap_signed_velocity_axis: bool = False,
 
         **kwargs
     ):
@@ -101,6 +108,13 @@ class LingbotVLAConfig(PretrainedConfig):
         self.architectures = ["LingbotVlaPolicy"]
         self.train_state_proj = train_state_proj
         self.train_expert_only = train_expert_only
+        self.recap_adapter_enabled = recap_adapter_enabled
+        self.train_recap_adapter_only = train_recap_adapter_only
+        self.recap_adapter_type = recap_adapter_type
+        self.recap_adapter_rank = recap_adapter_rank
+        self.recap_adapter_scale = recap_adapter_scale
+        self.recap_adapter_init_std = recap_adapter_init_std
+        self.recap_signed_velocity_axis = recap_signed_velocity_axis
         self.use_cache = False
         self.attention_implementation = attention_implementation
         self.num_steps = 10

@@ -133,6 +133,38 @@ class MyTrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "Train action expert only or not."},
     )
+    train_recap_adapter_only: bool = field(
+        default=False,
+        metadata={"help": "Freeze the base policy and train only the RECAP condition adapter."},
+    )
+    recap_adapter_enabled: bool = field(
+        default=False,
+        metadata={"help": "Inject a learned positive/negative RECAP embedding into action tokens."},
+    )
+    recap_adapter_type: Literal["embedding", "velocity_lora"] = field(
+        default="embedding",
+        metadata={"help": "RECAP adapter architecture."},
+    )
+    recap_adapter_rank: int = field(
+        default=8,
+        metadata={"help": "Rank of the condition-specific velocity LoRA adapter."},
+    )
+    recap_adapter_scale: float = field(
+        default=1.0,
+        metadata={"help": "Scale applied to the learned RECAP adapter residual."},
+    )
+    recap_adapter_init_std: float = field(
+        default=0.02,
+        metadata={"help": "Initialization scale for the velocity LoRA down projection."},
+    )
+    recap_signed_velocity_axis: bool = field(
+        default=False,
+        metadata={"help": "Derive negative as the exact inverse of the positive velocity residual."},
+    )
+    reset_recap_adapter: bool = field(
+        default=False,
+        metadata={"help": "Zero the RECAP adapter after loading base weights; use only for a fresh adapter."},
+    )
     train_state_proj: bool = field(
         default=True,
         metadata={"help": "Train state proj only or not."},
@@ -168,6 +200,15 @@ class MyTrainingArguments(TrainingArguments):
     align_params: Optional[Dict[str, Any]] = field(
         default_factory=dict,
         metadata={"help": "The config of vaco"},
+    )
+    enable_visual_distillation: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Build depth/video teachers and compute visual distillation losses. "
+                "Disable to retain checkpoint-compatible alignment modules while training action loss only."
+            )
+        },
     )
     attention_implementation: str = field(
         default="flex",
@@ -318,6 +359,48 @@ class MyDataArguments(DataArguments):
         default=False,
         metadata={"help": "Whether to use future image."},
     )
+    precomputed_action_chunks: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Treat each LeRobot action row as a complete [chunk_size, action_dim] chunk "
+                "instead of querying future action rows."
+            )
+        },
+    )
+    recap_enabled: bool = field(
+        default=False,
+        metadata={"help": "Enable RECAP positive/negative advantage prompt conditioning."},
+    )
+    recap_indicator_key: str = field(
+        default="recap_label",
+        metadata={"help": "LeRobot frame column containing the binary RECAP condition."},
+    )
+    recap_missing_condition: Literal["positive", "negative", "null", "error"] = field(
+        default="positive",
+        metadata={
+            "help": (
+                "Condition assigned when a dataset has no RECAP label. 'positive' treats "
+                "legacy expert demonstrations as positive examples."
+            )
+        },
+    )
+    recap_condition_dropout: float = field(
+        default=0.1,
+        metadata={"help": "Per-sample probability of dropping the RECAP condition for the null branch."},
+    )
+    recap_condition_name: str = field(
+        default="Advantage",
+        metadata={"help": "Text label prepended to the task prompt for RECAP conditioning."},
+    )
+    recap_prompt_enabled: bool = field(
+        default=True,
+        metadata={"help": "Encode RECAP conditions in task text prompts."},
+    )
+    recap_adapter_enabled: bool = field(
+        default=False,
+        metadata={"help": "Emit explicit RECAP condition ids for the model adapter."},
+    )
 
 
 @dataclass
@@ -376,10 +459,18 @@ def main():
         init_device=args.train.init_device,
         force_use_huggingface=args.model.force_use_huggingface,
         config_kwargs=config_kwargs,
+        attn_implementation=args.model.attn_implementation,
         moe_implementation=getattr(args.model, 'moe_implementation', None),
     )
-    use_depth_align = True if args.train.align_params != {} else False
-    use_future_depth = args.train.align_params.get('depth', {}).get('use_future_depth', False)
+    if args.train.reset_recap_adapter:
+        reset_adapter = getattr(getattr(model, "model", None), "reset_recap_adapter", None)
+        if reset_adapter is None:
+            raise ValueError("reset_recap_adapter requires a model with a RECAP adapter")
+        reset_adapter()
+        logger.info_rank0("Zero-initialized the RECAP condition adapter after loading base weights.")
+
+    use_depth_align = bool(args.train.align_params) and args.train.enable_visual_distillation
+    use_future_depth = use_depth_align and args.train.align_params.get('depth', {}).get('use_future_depth', False)
     use_future_video = use_depth_align and args.train.align_params.get('use_future_video', False)
     depth_model_type = None
     video_teacher = None
