@@ -2,6 +2,7 @@ import hashlib
 import json
 import sys
 import os
+import random
 import subprocess
 
 sys.path.append("./")
@@ -27,6 +28,14 @@ current_file_path = os.path.abspath(__file__)
 parent_directory = os.path.dirname(current_file_path)
 _INSTRUCTION_MAP_CACHE = {}
 _DECISION_MAP_CACHE = {}
+
+
+def deterministic_instructions_enabled():
+    return os.environ.get("RECAP_DETERMINISTIC_INSTRUCTIONS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
 
 
 def deterministic_task_instruction(task_name, seed, candidates):
@@ -342,14 +351,30 @@ def eval_policy(task_name,
 
         TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
         episode_info_list = [episode_info["info"]]
-        results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
+        deterministic_instructions = deterministic_instructions_enabled()
+        if deterministic_instructions:
+            random_state = random.getstate()
+            generation_seed = int.from_bytes(
+                hashlib.sha256(
+                    f"instruction-generation:{task_name}:{now_seed}".encode()
+                ).digest()[:8],
+                "big",
+            )
+            random.seed(generation_seed)
+            try:
+                results = generate_episode_descriptions(
+                    args["task_name"], episode_info_list, test_num
+                )
+            finally:
+                random.setstate(random_state)
+        else:
+            results = generate_episode_descriptions(
+                args["task_name"], episode_info_list, test_num
+            )
         instruction_override = os.environ.get("RECAP_TASK_INSTRUCTION", "").strip()
         instruction_map_path = os.environ.get(
             "RECAP_TASK_INSTRUCTION_MAP", ""
         ).strip()
-        deterministic_instructions = os.environ.get(
-            "RECAP_DETERMINISTIC_INSTRUCTIONS", ""
-        ).strip().lower() in {"1", "true", "yes"}
         configured_sources = sum(
             bool(value)
             for value in (
