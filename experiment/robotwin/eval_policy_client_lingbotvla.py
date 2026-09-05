@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sys
 import os
@@ -26,6 +27,17 @@ current_file_path = os.path.abspath(__file__)
 parent_directory = os.path.dirname(current_file_path)
 _INSTRUCTION_MAP_CACHE = {}
 _DECISION_MAP_CACHE = {}
+
+
+def deterministic_task_instruction(task_name, seed, candidates):
+    candidates = list(candidates)
+    if not candidates:
+        raise ValueError(
+            f"No generated instruction candidates for task={task_name!r}, seed={seed}"
+        )
+    digest = hashlib.sha256(f"{task_name}:{seed}".encode()).digest()
+    index = int.from_bytes(digest[:8], "big") % len(candidates)
+    return str(candidates[index])
 
 
 def mapped_counterfactual_decision(task_name):
@@ -335,25 +347,46 @@ def eval_policy(task_name,
         instruction_map_path = os.environ.get(
             "RECAP_TASK_INSTRUCTION_MAP", ""
         ).strip()
-        if instruction_override and instruction_map_path:
+        deterministic_instructions = os.environ.get(
+            "RECAP_DETERMINISTIC_INSTRUCTIONS", ""
+        ).strip().lower() in {"1", "true", "yes"}
+        configured_sources = sum(
+            bool(value)
+            for value in (
+                instruction_override,
+                instruction_map_path,
+                deterministic_instructions,
+            )
+        )
+        if configured_sources > 1:
             raise ValueError(
-                "Use either RECAP_TASK_INSTRUCTION or RECAP_TASK_INSTRUCTION_MAP"
+                "Use only one fixed, mapped, or deterministic RECAP instruction source"
             )
         instruction_from_map = (
-            None
-            if instruction_override
-            else mapped_task_instruction(task_name, now_seed)
+            mapped_task_instruction(task_name, now_seed)
+            if instruction_map_path
+            else None
         )
         instruction = (
             instruction_override
             or instruction_from_map
-            or np.random.choice(results[0][instruction_type])
+            or (
+                deterministic_task_instruction(
+                    task_name,
+                    now_seed,
+                    results[0][instruction_type],
+                )
+                if deterministic_instructions
+                else np.random.choice(results[0][instruction_type])
+            )
         )
         instruction_source = (
             "fixed"
             if instruction_override
             else "map"
             if instruction_from_map is not None
+            else "deterministic"
+            if deterministic_instructions
             else "random"
         )
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction

@@ -38,6 +38,7 @@
 #   --recap_condition_start_decision first conditioned decision index (default: 0)
 #   --recap_condition_decisions number of conditioned decisions (-1: all after start)
 #   --recap_instruction_map per-task, per-environment-seed instruction JSON
+#   --recap_deterministic_instructions choose task/seed-stable generated instructions
 #   --recap_rollout_dir optional directory for raw RECAP rollout bundles
 #   --keep_inference    keep inference servers resident after simulation
 #
@@ -83,6 +84,7 @@ counterfactual_policy_decision_map=""
 recap_condition_start_decision=0
 recap_condition_decisions=-1
 recap_instruction_map="${RECAP_TASK_INSTRUCTION_MAP:-}"
+recap_deterministic_instructions=False
 recap_rollout_dir=""
 robo_name="robotwin"
 video_fps=10
@@ -122,6 +124,7 @@ while [[ $# -gt 0 ]]; do
         --recap_condition_start_decision) recap_condition_start_decision="$2"; shift 2 ;;
         --recap_condition_decisions) recap_condition_decisions="$2"; shift 2 ;;
         --recap_instruction_map) recap_instruction_map="$2"; shift 2 ;;
+        --recap_deterministic_instructions) recap_deterministic_instructions=True; shift ;;
         --recap_rollout_dir) recap_rollout_dir="$2"; shift 2 ;;
         --robo_name)         robo_name="$2";         shift 2 ;;
         --video_fps)         video_fps="$2";         shift 2 ;;
@@ -164,6 +167,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --recap_condition_start_decision first conditioned decision (default: 0)"
             echo "  --recap_condition_decisions number conditioned (-1: all after start)"
             echo "  --recap_instruction_map per-task, per-seed instruction JSON"
+            echo "  --recap_deterministic_instructions use task/seed-stable generated text"
             echo "  --recap_rollout_dir save raw rollout bundles to this directory"
             echo "  --robo_name         robot config name (default: robotwin)"
             echo "  --keep_inference    keep inference servers resident after simulation"
@@ -307,6 +311,10 @@ if ! [[ "$recap_condition_decisions" =~ ^-?[0-9]+$ ]] || [ "$recap_condition_dec
 fi
 if [ -n "$recap_instruction_map" ] && [ ! -f "$recap_instruction_map" ]; then
     echo -e "\033[31mError: --recap_instruction_map is not a file: ${recap_instruction_map}\033[0m"
+    exit 1
+fi
+if [ -n "$recap_instruction_map" ] && [ "$recap_deterministic_instructions" = True ]; then
+    echo -e "\033[31mError: instruction map and deterministic instructions are mutually exclusive\033[0m"
     exit 1
 fi
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -593,9 +601,10 @@ launch_task() {
     RECAP_COUNTERFACTUAL_POLICY_DECISION="${counterfactual_policy_decision}" \
     RECAP_COUNTERFACTUAL_POLICY_DECISION_MAP="${counterfactual_policy_decision_map}" \
     RECAP_TASK_INSTRUCTION_MAP="${recap_instruction_map}" \
+    RECAP_DETERMINISTIC_INSTRUCTIONS="${recap_deterministic_instructions}" \
     RECAP_CONDITION_START_DECISION="${recap_condition_start_decision}" \
     RECAP_CONDITION_DECISIONS="${recap_condition_decisions}" \
-    setsid bash -c "source ${conda_sh} && conda activate ${sim_env} && export PYTHONPATH=\"\$(python -c 'import site;print(site.getsitepackages()[0])')\${PYTHONPATH:+:\$PYTHONPATH}\" && PYTHONUNBUFFERED=1 PYTHONWARNINGS=ignore::UserWarning XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 RECAP_POLICY_SEED='${slot_policy_seed}' RECAP_CONTINUATION_POLICY_SEED='${continuation_policy_seed}' RECAP_COUNTERFACTUAL_POLICY_DECISION='${counterfactual_policy_decision}' RECAP_COUNTERFACTUAL_POLICY_DECISION_MAP='${counterfactual_policy_decision_map}' RECAP_TASK_INSTRUCTION_MAP='${recap_instruction_map}' RECAP_CONDITION_START_DECISION='${recap_condition_start_decision}' RECAP_CONDITION_DECISIONS='${recap_condition_decisions}' python -u ${eval_client_dst} --config policy/${policy_name}/deploy_policy.yml \
+    setsid bash -c "source ${conda_sh} && conda activate ${sim_env} && export PYTHONPATH=\"\$(python -c 'import site;print(site.getsitepackages()[0])')\${PYTHONPATH:+:\$PYTHONPATH}\" && PYTHONUNBUFFERED=1 PYTHONWARNINGS=ignore::UserWarning XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 RECAP_POLICY_SEED='${slot_policy_seed}' RECAP_CONTINUATION_POLICY_SEED='${continuation_policy_seed}' RECAP_COUNTERFACTUAL_POLICY_DECISION='${counterfactual_policy_decision}' RECAP_COUNTERFACTUAL_POLICY_DECISION_MAP='${counterfactual_policy_decision_map}' RECAP_TASK_INSTRUCTION_MAP='${recap_instruction_map}' RECAP_DETERMINISTIC_INSTRUCTIONS='${recap_deterministic_instructions}' RECAP_CONDITION_START_DECISION='${recap_condition_start_decision}' RECAP_CONDITION_DECISIONS='${recap_condition_decisions}' python -u ${eval_client_dst} --config policy/${policy_name}/deploy_policy.yml \
         --overrides \
         --task_name ${task_name} \
         --task_config ${task_config} \

@@ -478,10 +478,14 @@ perfect tasks and failed validation candidates safe regression guards.
 
 For collection across tasks, first record common-noise reference rollouts, then
 run `scripts/recap_plan_task_interventions.py`. It derives the modal successful
-terminal decision per task and emits strict decision and per-seed instruction
-maps. Pass those maps with `--counterfactual_policy_decision_map` and
-`--recap_instruction_map` so every branch varies the planned action while
-reusing exactly the same task instruction. Use
+terminal decision per task and emits a strict decision map. Pass it with
+`--counterfactual_policy_decision_map`. For broad collection, use
+`--recap_deterministic_instructions`: it chooses generated text by a stable
+hash of canonical task and environment seed, including valid seeds that a
+reference run may have skipped during environment initialization. A frozen
+`--recap_instruction_map` remains available when it is known to cover every
+valid seed. Thus every branch varies the planned action while reusing exactly
+the same task instruction. Use
 `scripts/recap_select_task_pairs.py` to select balanced mixed-outcome groups per
 task. Tasks with no mixed group must collect another candidate decision or
 continuation schedule; they must not receive outcome-BC labels.
