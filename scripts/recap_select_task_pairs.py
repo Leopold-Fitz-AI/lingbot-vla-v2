@@ -33,6 +33,7 @@ def main() -> None:
     args.output_root.mkdir(parents=True)
     selected = {}
     insufficient = {}
+    rejected = {}
     for task, decision in sorted(decision_map["tasks"].items()):
         task_output = args.output_root / task
         try:
@@ -46,10 +47,18 @@ def main() -> None:
                 image_mae_tolerance=args.image_mae_tolerance,
             )
         except ValueError as error:
-            if "No state group contains both" not in str(error):
-                raise
-            insufficient[task] = str(error)
-            continue
+            message = str(error)
+            if "No state group contains both" in message:
+                insufficient[task] = message
+                continue
+            if (
+                "exceed pairing tolerance" in message
+                or "Task mismatch" in message
+                or "identical" in message
+            ):
+                rejected[task] = message
+                continue
+            raise
         if summary["positive"] < args.minimum_positive:
             insufficient[task] = (
                 f"only {summary['positive']} positive samples; "
@@ -64,8 +73,10 @@ def main() -> None:
         "decision_map": str(args.decision_map.resolve()),
         "selected_tasks": selected,
         "insufficient_tasks": insufficient,
+        "rejected_tasks": rejected,
         "selected_task_count": len(selected),
         "insufficient_task_count": len(insufficient),
+        "rejected_task_count": len(rejected),
     }
     (args.output_root / "selection_summary.json").write_text(
         json.dumps(result, indent=2, sort_keys=True) + "\n"
