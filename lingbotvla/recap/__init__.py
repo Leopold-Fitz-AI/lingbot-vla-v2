@@ -1,6 +1,11 @@
 """Utilities for RECAP-style policy conditioning and value learning."""
 
-from .adapter import apply_recap_velocity_lora, build_recap_condition_embedding
+from .adapter import (
+    apply_recap_velocity_lora,
+    build_recap_condition_embedding,
+    load_counterfactual_decision_map,
+    load_recap_adapter_registry,
+)
 from .cfg import (
     combine_cfg_velocities,
     combine_cfg_velocity_batch,
@@ -43,6 +48,8 @@ __all__ = [
     "discretize_returns",
     "format_recap_prompt",
     "label_advantages",
+    "load_counterfactual_decision_map",
+    "load_recap_adapter_registry",
     "maybe_drop_recap_condition",
     "monte_carlo_returns",
     "normalize_recap_condition",

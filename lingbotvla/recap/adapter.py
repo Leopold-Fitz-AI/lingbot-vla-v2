@@ -2,8 +2,87 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+from pathlib import Path
+
 import torch
 import torch.nn.functional as F
+
+
+def load_counterfactual_decision_map(path: str | Path) -> dict:
+    """Load a strict canonical-task to non-negative decision-index map."""
+
+    map_path = Path(path).resolve()
+    with map_path.open() as handle:
+        payload = json.load(handle)
+    if payload.get("schema_version") != 1 or not isinstance(payload.get("tasks"), dict):
+        raise ValueError(
+            "Counterfactual decision map must have schema_version=1 and a tasks object"
+        )
+    tasks = {}
+    for task, decision in payload["tasks"].items():
+        if not isinstance(task, str) or not task:
+            raise ValueError("Counterfactual decision map has an invalid task name")
+        if isinstance(decision, bool) or not isinstance(decision, int) or decision < 0:
+            raise ValueError(
+                f"Counterfactual decision for {task!r} must be a non-negative integer"
+            )
+        tasks[task] = decision
+    return {**payload, "path": map_path, "tasks": tasks}
+
+
+def load_recap_adapter_registry(path: str | Path) -> dict:
+    """Load a task-to-adapter registry and verify every compact artifact.
+
+    Artifact paths may be relative to the registry file. SHA-256 is mandatory
+    so a corrupt or stale task adapter can never silently alter the policy.
+    """
+
+    registry_path = Path(path).resolve()
+    with registry_path.open() as handle:
+        payload = json.load(handle)
+    if payload.get("schema_version") != 1:
+        raise ValueError("RECAP adapter registry schema_version must be 1")
+    tasks = payload.get("tasks")
+    if not isinstance(tasks, dict):
+        raise ValueError("RECAP adapter registry must contain a tasks object")
+
+    resolved = {}
+    for task, entry in tasks.items():
+        if not isinstance(task, str) or not task.strip():
+            raise ValueError("RECAP adapter registry task names must be non-empty")
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            raise ValueError(f"Registry entry for {task!r} must contain path")
+        expected_sha256 = entry.get("sha256")
+        if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
+            raise ValueError(f"Registry entry for {task!r} requires SHA-256")
+        artifact = Path(entry["path"])
+        if not artifact.is_absolute():
+            artifact = registry_path.parent / artifact
+        artifact = artifact.resolve()
+        if not artifact.is_file():
+            raise FileNotFoundError(f"RECAP adapter for {task!r} not found: {artifact}")
+        digest = hashlib.sha256()
+        with artifact.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        actual_sha256 = digest.hexdigest()
+        if actual_sha256 != expected_sha256.lower():
+            raise ValueError(
+                f"RECAP adapter SHA-256 mismatch for {task!r}: "
+                f"expected {expected_sha256}, got {actual_sha256}"
+            )
+        resolved[task] = {
+            **entry,
+            "path": artifact,
+            "sha256": actual_sha256,
+        }
+    return {
+        **payload,
+        "registry_path": registry_path,
+        "tasks": resolved,
+    }
 
 
 def _normalize_condition_ids(condition_ids, *, batch_size, device):

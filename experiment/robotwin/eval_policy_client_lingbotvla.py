@@ -1,3 +1,4 @@
+import json
 import sys
 import os
 import subprocess
@@ -23,6 +24,57 @@ from generate_episode_instructions import *
 
 current_file_path = os.path.abspath(__file__)
 parent_directory = os.path.dirname(current_file_path)
+_INSTRUCTION_MAP_CACHE = {}
+_DECISION_MAP_CACHE = {}
+
+
+def mapped_counterfactual_decision(task_name):
+    path = os.environ.get(
+        "RECAP_COUNTERFACTUAL_POLICY_DECISION_MAP", ""
+    ).strip()
+    if not path:
+        raw = os.environ.get("RECAP_COUNTERFACTUAL_POLICY_DECISION")
+        return None if raw in (None, "") else int(raw)
+    if path not in _DECISION_MAP_CACHE:
+        with open(path) as handle:
+            payload = json.load(handle)
+        if payload.get("schema_version") != 1 or not isinstance(
+            payload.get("tasks"), dict
+        ):
+            raise ValueError(
+                "Counterfactual decision map must have schema_version=1 and a tasks object"
+            )
+        _DECISION_MAP_CACHE[path] = payload["tasks"]
+    if task_name not in _DECISION_MAP_CACHE[path]:
+        raise ValueError(f"Decision map has no entry for task={task_name!r}")
+    return int(_DECISION_MAP_CACHE[path][task_name])
+
+
+def mapped_task_instruction(task_name, seed):
+    path = os.environ.get("RECAP_TASK_INSTRUCTION_MAP", "").strip()
+    if not path:
+        return None
+    if path not in _INSTRUCTION_MAP_CACHE:
+        with open(path) as handle:
+            payload = json.load(handle)
+        if payload.get("schema_version") != 1 or not isinstance(
+            payload.get("tasks"), dict
+        ):
+            raise ValueError(
+                "RECAP instruction map must have schema_version=1 and a tasks object"
+            )
+        _INSTRUCTION_MAP_CACHE[path] = payload["tasks"]
+    task_instructions = _INSTRUCTION_MAP_CACHE[path].get(task_name)
+    if not isinstance(task_instructions, dict) or str(seed) not in task_instructions:
+        raise ValueError(
+            f"Instruction map has no entry for task={task_name!r}, seed={seed}"
+        )
+    instruction = task_instructions[str(seed)]
+    if not isinstance(instruction, str) or not instruction.strip():
+        raise ValueError(
+            f"Instruction map entry for task={task_name!r}, seed={seed} is invalid"
+        )
+    return instruction
 
 
 def class_decorator(task_name):
@@ -280,10 +332,29 @@ def eval_policy(task_name,
         episode_info_list = [episode_info["info"]]
         results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
         instruction_override = os.environ.get("RECAP_TASK_INSTRUCTION", "").strip()
+        instruction_map_path = os.environ.get(
+            "RECAP_TASK_INSTRUCTION_MAP", ""
+        ).strip()
+        if instruction_override and instruction_map_path:
+            raise ValueError(
+                "Use either RECAP_TASK_INSTRUCTION or RECAP_TASK_INSTRUCTION_MAP"
+            )
+        instruction_from_map = (
+            None
+            if instruction_override
+            else mapped_task_instruction(task_name, now_seed)
+        )
         instruction = (
             instruction_override
+            or instruction_from_map
+            or np.random.choice(results[0][instruction_type])
+        )
+        instruction_source = (
+            "fixed"
             if instruction_override
-            else np.random.choice(results[0][instruction_type])
+            else "map"
+            if instruction_from_map is not None
+            else "random"
         )
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
 
@@ -308,8 +379,11 @@ def eval_policy(task_name,
                     "continuation_policy_seed": os.environ.get(
                         "RECAP_CONTINUATION_POLICY_SEED"
                     ),
-                    "counterfactual_policy_decision": os.environ.get(
-                        "RECAP_COUNTERFACTUAL_POLICY_DECISION"
+                    "counterfactual_policy_decision": mapped_counterfactual_decision(
+                        task_name
+                    ),
+                    "counterfactual_policy_decision_map": os.environ.get(
+                        "RECAP_COUNTERFACTUAL_POLICY_DECISION_MAP"
                     ),
                     "recap_condition_start_decision": os.environ.get(
                         "RECAP_CONDITION_START_DECISION"
@@ -317,7 +391,9 @@ def eval_policy(task_name,
                     "recap_condition_decisions": os.environ.get(
                         "RECAP_CONDITION_DECISIONS"
                     ),
-                    "instruction_overridden": bool(instruction_override),
+                    "instruction_overridden": instruction_source != "random",
+                    "instruction_source": instruction_source,
+                    "instruction_map": os.environ.get("RECAP_TASK_INSTRUCTION_MAP"),
                     "step_limit": TASK_ENV.step_lim,
                 },
             )
@@ -355,7 +431,14 @@ def eval_policy(task_name,
         path_to_pi_model = None
         if usr_args is not None and "new_ckpt_path" in usr_args:
             path_to_pi_model = usr_args['new_ckpt_path']
-        ret = model.infer(dict(reset = True, robo_name=usr_args['robo_name'], path_to_pi_model=path_to_pi_model))
+        ret = model.infer(
+            dict(
+                reset=True,
+                robo_name=usr_args['robo_name'],
+                path_to_pi_model=path_to_pi_model,
+                task_name=task_name,
+            )
+        )
         
         while TASK_ENV.take_action_cnt<TASK_ENV.step_lim and not succ:
             observation = TASK_ENV.get_obs()

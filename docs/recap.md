@@ -447,6 +447,45 @@ untouched official base checkpoint. This resolves the diagnosed `click_bell`
 instability, but it is not evidence for a 50-task improvement until the same
 protocol is repeated across tasks and larger held-out sets.
 
+## Scaling safely to the 50-task suite
+
+Do not apply one task's residual to every task. Train compact task-specific
+adapters and deploy them through a checksum-verified registry:
+
+```json
+{
+  "schema_version": 1,
+  "tasks": {
+    "click_bell": {
+      "path": "adapters/click_bell.safetensors",
+      "sha256": "..."
+    }
+  }
+}
+```
+
+```bash
+python -m deploy.lingbot_vla_v2_policy \
+  --model_path /path/to/adapter-enabled-base-wrapper/hf_ckpt \
+  --recap_adapter_registry /path/to/registry.json \
+  --recap_condition positive
+```
+
+The RoboTwin client sends the canonical task name at reset. The server swaps
+only the tiny adapter tensors. A task absent from the validated registry is
+forced to null/base even if the server default is positive. This makes already
+perfect tasks and failed validation candidates safe regression guards.
+
+For collection across tasks, first record common-noise reference rollouts, then
+run `scripts/recap_plan_task_interventions.py`. It derives the modal successful
+terminal decision per task and emits strict decision and per-seed instruction
+maps. Pass those maps with `--counterfactual_policy_decision_map` and
+`--recap_instruction_map` so every branch varies the planned action while
+reusing exactly the same task instruction. Use
+`scripts/recap_select_task_pairs.py` to select balanced mixed-outcome groups per
+task. Tasks with no mixed group must collect another candidate decision or
+continuation schedule; they must not receive outcome-BC labels.
+
 ## Recommended experiment
 
 1. Select difficult target tasks and easy regression-guard tasks.

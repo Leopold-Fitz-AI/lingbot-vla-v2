@@ -31,6 +31,10 @@ from lingbotvla.models.vla.lingbot_vla.qwen3vl_in_vla import apply_lingbot_qwen3
 
 from lingbotvla.data.vla_data.utils import FeatureTransform
 from lingbotvla.models import build_processor
+from lingbotvla.recap.adapter import (
+    load_counterfactual_decision_map,
+    load_recap_adapter_registry,
+)
 from lingbotvla.recap.conditioning import normalize_recap_condition
 import time
 import random
@@ -241,7 +245,9 @@ class LingbotVLAv2Server:
         policy_seed=42,
         continuation_policy_seed=None,
         counterfactual_policy_decision=0,
+        counterfactual_policy_decision_map=None,
         recap_adapter_path=None,
+        recap_adapter_registry=None,
     ) -> None:
         assert not (use_bf16 and use_fp32), 'Bfloat16 or Float32!!!'
         self.adaptive_ensemble_alpha = adaptive_ensemble_alpha
@@ -264,6 +270,16 @@ class LingbotVLAv2Server:
         self.counterfactual_policy_decision = int(counterfactual_policy_decision)
         if self.counterfactual_policy_decision < 0:
             raise ValueError("counterfactual_policy_decision must be non-negative")
+        self.counterfactual_policy_decision_map = (
+            None
+            if counterfactual_policy_decision_map is None
+            else load_counterfactual_decision_map(
+                counterfactual_policy_decision_map
+            )
+        )
+        self.active_counterfactual_policy_decision = (
+            self.counterfactual_policy_decision
+        )
         if self.recap_condition_decisions < -1:
             raise ValueError("recap_condition_decisions must be -1 or non-negative")
         if not np.isfinite(self.recap_cfg_scale) or self.recap_cfg_scale < 0:
@@ -272,6 +288,10 @@ class LingbotVLAv2Server:
             raise ValueError("RECAP CFG is defined between positive and null conditions")
 
         self.task_description = None
+        if recap_adapter_path is not None and recap_adapter_registry is not None:
+            raise ValueError(
+                "Use either recap_adapter_path or recap_adapter_registry, not both"
+            )
         self.recap_adapter_path = (
             None if recap_adapter_path is None else Path(recap_adapter_path)
         )
@@ -279,6 +299,13 @@ class LingbotVLAv2Server:
             raise FileNotFoundError(
                 f"RECAP adapter artifact does not exist: {self.recap_adapter_path}"
             )
+        self.recap_adapter_registry = (
+            None
+            if recap_adapter_registry is None
+            else load_recap_adapter_registry(recap_adapter_registry)
+        )
+        self.active_recap_task = None
+        self.active_recap_adapter = self.recap_adapter_registry is None
 
         if self.recap_cfg_scale != 1.0 and use_compile:
             print("RECAP CFG currently uses eager inference; disabling torch.compile for correctness.")
@@ -311,11 +338,16 @@ class LingbotVLAv2Server:
                     merged_weights[key] = f.get_tensor(key)
         return self.vla.load_state_dict(merged_weights, strict=strict)
 
-    def load_recap_adapter_weights(self):
-        if self.recap_adapter_path is None:
+    def load_recap_adapter_weights(self, artifact_path=None):
+        artifact_path = (
+            self.recap_adapter_path
+            if artifact_path is None
+            else Path(artifact_path)
+        )
+        if artifact_path is None:
             return
         adapter_weights = {}
-        with safe_open(self.recap_adapter_path, framework="pt", device="cpu") as f:
+        with safe_open(artifact_path, framework="pt", device="cpu") as f:
             metadata = f.metadata() or {}
             for key in f.keys():
                 if not any(part.startswith("recap_") for part in key.split(".")):
@@ -348,7 +380,7 @@ class LingbotVLAv2Server:
                 f"Unexpected adapter tensor(s): {result.unexpected_keys}"
             )
         print(
-            f"Loaded compact RECAP adapter: {self.recap_adapter_path}",
+            f"Loaded compact RECAP adapter: {artifact_path}",
             flush=True,
         )
 
@@ -435,11 +467,15 @@ class LingbotVLAv2Server:
 
         self.vla = LingBotVlaV2InferencePolicy(config, eval=True)
 
+        external_adapter = (
+            self.recap_adapter_path is not None
+            or self.recap_adapter_registry is not None
+        )
         load_result = self.load_model_weights(
             path_to_pi_model,
-            strict=self.recap_adapter_path is None,
+            strict=not external_adapter,
         )
-        if self.recap_adapter_path is not None:
+        if external_adapter:
             non_recap_missing = [
                 key
                 for key in load_result.missing_keys
@@ -451,7 +487,17 @@ class LingbotVLAv2Server:
                     f"missing={non_recap_missing}, "
                     f"unexpected={load_result.unexpected_keys}"
                 )
-            self.load_recap_adapter_weights()
+            expected_adapter_tensors = [
+                key
+                for key in self.vla.state_dict()
+                if any(part.startswith("recap_") for part in key.split("."))
+            ]
+            if not expected_adapter_tensors:
+                raise ValueError(
+                    "External RECAP adapters require an adapter-enabled inference config"
+                )
+            if self.recap_adapter_path is not None:
+                self.load_recap_adapter_weights()
         
         self.vla.feature_transform = None
         self.data_config = data_config
@@ -470,8 +516,29 @@ class LingbotVLAv2Server:
 
         return self.vla
 
-    def reset(self, robo_name, path_to_pi_model = None) -> None:
+    def activate_recap_task(self, task_name):
+        if self.recap_adapter_registry is None:
+            return
+        task_name = None if task_name is None else str(task_name)
+        if task_name == self.active_recap_task:
+            return
+        self.active_recap_task = task_name
+        self.active_recap_adapter = False
+        entry = self.recap_adapter_registry["tasks"].get(task_name)
+        if entry is None:
+            print(
+                f"No validated RECAP adapter for task {task_name!r}; using null/base",
+                flush=True,
+            )
+            return
+        self.load_recap_adapter_weights(entry["path"])
+        self.active_recap_adapter = True
+        print(f"Activated RECAP adapter for task {task_name!r}", flush=True)
+
+    def reset(self, robo_name, path_to_pi_model = None, task_name=None) -> None:
         if path_to_pi_model is not None:
+            self.active_recap_task = None
+            self.active_recap_adapter = self.recap_adapter_registry is None
             self.vla = self.load_vla(path_to_pi_model)
             if self.use_bf16:
                 self.vla = self.vla.to(torch.bfloat16).cuda().eval()
@@ -480,6 +547,19 @@ class LingbotVLAv2Server:
                 self.vla.model.float()
                 self.vla = self.vla.cuda().eval()
 
+        if self.counterfactual_policy_decision_map is not None:
+            if task_name not in self.counterfactual_policy_decision_map["tasks"]:
+                raise ValueError(
+                    f"Task {task_name!r} is missing from counterfactual decision map"
+                )
+            self.active_counterfactual_policy_decision = (
+                self.counterfactual_policy_decision_map["tasks"][task_name]
+            )
+        else:
+            self.active_counterfactual_policy_decision = (
+                self.counterfactual_policy_decision
+            )
+        self.activate_recap_task(task_name)
         self.global_step = 0
         self.last_action_chunk = None
         self.last_normalized_action_chunk = None
@@ -581,7 +661,10 @@ class LingbotVLAv2Server:
         if not isinstance(observations, (list, tuple)) or len(observations) == 0:
             raise ValueError("batch observation must be a non-empty list")
         condition_offset = self.global_step - self.recap_condition_start_decision
-        condition_active = condition_offset >= 0 and (
+        adapter_available = (
+            self.recap_adapter_registry is None or self.active_recap_adapter
+        )
+        condition_active = adapter_available and condition_offset >= 0 and (
             self.recap_condition_decisions == -1
             or condition_offset < self.recap_condition_decisions
         )
@@ -631,7 +714,7 @@ class LingbotVLAv2Server:
             # removing future policy noise as an outcome confounder.
             action_seed = (
                 self.policy_seed
-                if self.global_step == self.counterfactual_policy_decision
+                if self.global_step == self.active_counterfactual_policy_decision
                 else self.continuation_policy_seed + self.global_step
             )
             torch.manual_seed(action_seed)
@@ -657,7 +740,15 @@ class LingbotVLAv2Server:
         # IMPORTANT: Let's say crop scale == 0.9. To get the new height and width (post-crop), multiply
         #            the original height and width by sqrt(0.9) -- not 0.9!
         if 'reset' in observation and observation['reset']:
-            self.reset(robo_name=observation['robo_name'], path_to_pi_model=observation['path_to_pi_model'] if 'path_to_pi_model' in observation else None)
+            self.reset(
+                robo_name=observation['robo_name'],
+                path_to_pi_model=(
+                    observation['path_to_pi_model']
+                    if 'path_to_pi_model' in observation
+                    else None
+                ),
+                task_name=observation.get('task_name'),
+            )
             return dict(action = None)
 
         is_batch = 'batch' in observation
@@ -801,9 +892,19 @@ def main():
         help="Decision index whose action noise uses policy_seed during counterfactual collection.",
     )
     parser.add_argument(
+        "--counterfactual_policy_decision_map",
+        default=None,
+        help="JSON map assigning a counterfactual decision index to each task.",
+    )
+    parser.add_argument(
         "--recap_adapter_path",
         default=None,
         help="Optional compact RECAP safetensors artifact overlaid on the base checkpoint.",
+    )
+    parser.add_argument(
+        "--recap_adapter_registry",
+        default=None,
+        help="Task-to-adapter JSON registry; missing tasks safely use null/base.",
     )
     parser.add_argument(
         "--recap_condition",
@@ -849,7 +950,9 @@ def main():
         policy_seed=args.policy_seed,
         continuation_policy_seed=args.continuation_policy_seed,
         counterfactual_policy_decision=args.counterfactual_policy_decision,
+        counterfactual_policy_decision_map=args.counterfactual_policy_decision_map,
         recap_adapter_path=args.recap_adapter_path,
+        recap_adapter_registry=args.recap_adapter_registry,
     )
     model_server = WebsocketPolicyServer(model, port=args.port)
     model_server.serve_forever()

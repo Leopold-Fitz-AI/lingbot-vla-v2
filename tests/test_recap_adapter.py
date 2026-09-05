@@ -1,10 +1,16 @@
+import hashlib
+import json
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import torch
 
 from lingbotvla.recap.adapter import (
     apply_recap_velocity_lora,
     build_recap_condition_embedding,
+    load_counterfactual_decision_map,
+    load_recap_adapter_registry,
 )
 
 
@@ -81,6 +87,61 @@ class RecapAdapterTest(unittest.TestCase):
         self.assertTrue(torch.equal(residual, torch.zeros_like(residual)))
         residual.sum().backward()
         self.assertGreater(torch.count_nonzero(lora_b.grad).item(), 0)
+
+    def test_loads_relative_task_adapter_registry_and_checks_hash(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "bell.safetensors"
+            artifact.write_bytes(b"adapter")
+            digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            registry = root / "registry.json"
+            registry.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "tasks": {
+                            "click_bell": {
+                                "path": artifact.name,
+                                "sha256": digest,
+                            }
+                        },
+                    }
+                )
+            )
+            loaded = load_recap_adapter_registry(registry)
+            self.assertEqual(
+                loaded["tasks"]["click_bell"]["path"], artifact.resolve()
+            )
+            self.assertEqual(loaded["tasks"]["click_bell"]["sha256"], digest)
+
+            artifact.write_bytes(b"corrupt")
+            with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+                load_recap_adapter_registry(registry)
+
+    def test_loads_and_validates_counterfactual_decision_map(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "decisions.json"
+            path.write_text(
+                json.dumps(
+                    {"schema_version": 1, "tasks": {"click_bell": 1}}
+                )
+            )
+            loaded = load_counterfactual_decision_map(path)
+            self.assertEqual(loaded["tasks"], {"click_bell": 1})
+            path.write_text(
+                json.dumps(
+                    {"schema_version": 1, "tasks": {"click_bell": -1}}
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "non-negative"):
+                load_counterfactual_decision_map(path)
+
+    def test_rejects_invalid_adapter_registry(self):
+        with TemporaryDirectory() as directory:
+            registry = Path(directory) / "registry.json"
+            registry.write_text(json.dumps({"schema_version": 2, "tasks": {}}))
+            with self.assertRaisesRegex(ValueError, "schema_version"):
+                load_recap_adapter_registry(registry)
 
     def test_rejects_invalid_ids_and_shapes(self):
         parameters = torch.zeros(2, 4)

@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import shutil
 from collections import defaultdict
 from pathlib import Path
@@ -22,6 +23,14 @@ import numpy as np
 
 def _manifest_paths(root: Path) -> list[Path]:
     return sorted(root.rglob("manifest.json"))
+
+
+def _attempt_number(path: Path) -> int:
+    for part in path.parts:
+        match = re.fullmatch(r"attempt-(\d+)", part)
+        if match:
+            return int(match.group(1))
+    return 0
 
 
 def _step(manifest: dict, decision_index: int) -> dict:
@@ -94,6 +103,7 @@ def select_paired_decisions(
     balance_outcomes: bool = False,
     observation_atol: float = 0.0,
     image_mae_tolerance: float = 0.0,
+    task_name: str | None = None,
 ) -> dict:
     if len(inputs) < 2:
         raise ValueError("At least two independently sampled rollout roots are required")
@@ -111,22 +121,41 @@ def select_paired_decisions(
         paths = _manifest_paths(root)
         if not paths:
             raise ValueError(f"No manifests found under {root}")
+        matched_paths = 0
+        root_rows = {}
         for path in paths:
             manifest = json.loads(path.read_text(encoding="utf-8"))
+            manifest_task_name = (manifest.get("metadata") or {}).get("task_name")
+            if task_name is not None and manifest_task_name != task_name:
+                continue
+            matched_paths += 1
             seed = manifest.get("seed")
             if seed is None:
                 raise ValueError(f"Manifest has no environment seed: {path}")
+            if not any(
+                int(item.get("decision_index", -1)) == decision_index
+                for item in manifest.get("steps", [])
+            ):
+                continue
             step = _step(manifest, decision_index)
-            groups[int(seed)].append(
-                {
-                    "root": root,
-                    "source": source_name,
-                    "manifest_path": path,
-                    "manifest": manifest,
-                    "step": step,
-                    "npz": path.parent / step["file"],
-                }
-            )
+            row = {
+                "root": root,
+                "source": source_name,
+                "manifest_path": path,
+                "manifest": manifest,
+                "step": step,
+                "npz": path.parent / step["file"],
+            }
+            key = int(seed)
+            previous = root_rows.get(key)
+            if previous is None or _attempt_number(path) > _attempt_number(
+                previous["manifest_path"]
+            ):
+                root_rows[key] = row
+        if task_name is not None and matched_paths == 0:
+            raise ValueError(f"No manifests for task {task_name!r} under {root}")
+        for seed, row in root_rows.items():
+            groups[seed].append(row)
 
     selected_groups = {
         seed: rows
@@ -258,6 +287,7 @@ def select_paired_decisions(
             "schema_version": 1,
             "inputs": [str(path.expanduser().resolve()) for path in inputs],
             "decision_index": decision_index,
+            "task_name": task_name,
             "balance_outcomes": balance_outcomes,
             "observation_atol": observation_atol,
             "image_mae_tolerance": image_mae_tolerance,
@@ -284,6 +314,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", action="append", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--decision-index", type=int, default=0)
+    parser.add_argument("--task")
     parser.add_argument("--balance-outcomes", action="store_true")
     parser.add_argument("--observation-atol", type=float, default=0.0)
     parser.add_argument("--image-mae-tolerance", type=float, default=0.0)
@@ -303,6 +334,7 @@ def main() -> None:
         balance_outcomes=args.balance_outcomes,
         observation_atol=args.observation_atol,
         image_mae_tolerance=args.image_mae_tolerance,
+        task_name=args.task,
     )
     print(json.dumps(summary, ensure_ascii=False))
 
