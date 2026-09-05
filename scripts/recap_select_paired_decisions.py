@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import itertools
 import json
 import re
 import shutil
@@ -71,6 +72,27 @@ def _load_arrays(path: Path) -> tuple[dict[str, np.ndarray], str]:
     return observation, action
 
 
+def _observation_differences(
+    reference: dict[str, np.ndarray],
+    candidate: dict[str, np.ndarray],
+) -> tuple[float, float] | None:
+    if reference.keys() != candidate.keys():
+        return None
+    numeric_max = image_mae_max = 0.0
+    for key, expected in reference.items():
+        actual = candidate[key]
+        if expected.shape != actual.shape or expected.dtype != actual.dtype:
+            return None
+        if np.array_equal(expected, actual):
+            continue
+        difference = np.abs(expected.astype(np.float64) - actual.astype(np.float64))
+        if "images" in key:
+            image_mae_max = max(image_mae_max, float(difference.mean()))
+        else:
+            numeric_max = max(numeric_max, float(difference.max()))
+    return numeric_max, image_mae_max
+
+
 def _observations_match(
     reference: dict[str, np.ndarray],
     candidate: dict[str, np.ndarray],
@@ -78,21 +100,74 @@ def _observations_match(
     numeric_atol: float,
     image_mae_tolerance: float,
 ) -> bool:
-    if reference.keys() != candidate.keys():
-        return False
-    for key, expected in reference.items():
-        actual = candidate[key]
-        if expected.shape != actual.shape or expected.dtype != actual.dtype:
-            return False
-        if np.array_equal(expected, actual):
-            continue
-        difference = np.abs(expected.astype(np.float64) - actual.astype(np.float64))
-        if "images" in key:
-            if float(difference.mean()) > image_mae_tolerance:
-                return False
-        elif float(difference.max()) > numeric_atol:
-            return False
-    return True
+    differences = _observation_differences(reference, candidate)
+    return differences is not None and (
+        differences[0] <= numeric_atol
+        and differences[1] <= image_mae_tolerance
+    )
+
+
+def _minimum_cost_pairs(
+    successes: list[dict],
+    failures: list[dict],
+    *,
+    numeric_atol: float,
+    image_mae_tolerance: float,
+) -> list[tuple[dict, dict, float, float]]:
+    """Return a maximum-cardinality, minimum-drift bipartite matching."""
+
+    def loaded(row: dict) -> tuple[dict[str, np.ndarray], str]:
+        value = row.get("_loaded_arrays")
+        if value is None:
+            value = _load_arrays(row["npz"])
+            row["_loaded_arrays"] = value
+        return value
+
+    candidates = {}
+    for success_index, success in enumerate(successes):
+        success_observation, success_action = loaded(success)
+        for failure_index, failure in enumerate(failures):
+            failure_observation, failure_action = loaded(failure)
+            differences = _observation_differences(
+                success_observation, failure_observation
+            )
+            if (
+                differences is not None
+                and differences[0] <= numeric_atol
+                and differences[1] <= image_mae_tolerance
+                and success_action != failure_action
+            ):
+                candidates[(success_index, failure_index)] = differences
+
+    maximum = min(len(successes), len(failures))
+    for count in range(maximum, 0, -1):
+        options = []
+        for success_indices in itertools.combinations(range(len(successes)), count):
+            for failure_indices in itertools.permutations(range(len(failures)), count):
+                keys = tuple(zip(success_indices, failure_indices))
+                if not all(key in candidates for key in keys):
+                    continue
+                differences = [candidates[key] for key in keys]
+                numeric_scale = numeric_atol if numeric_atol > 0 else 1.0
+                image_scale = (
+                    image_mae_tolerance if image_mae_tolerance > 0 else 1.0
+                )
+                cost = sum(
+                    numeric / numeric_scale + image / image_scale
+                    for numeric, image in differences
+                )
+                tie_breaker = tuple(
+                    (successes[left]["source"], failures[right]["source"])
+                    for left, right in keys
+                )
+                options.append((cost, tie_breaker, keys, differences))
+        if options:
+            _, _, keys, differences = min(options)
+            return [
+                (successes[left], failures[right], numeric, image)
+                for (left, right), (numeric, image) in zip(keys, differences)
+            ]
+    return []
 
 
 def select_paired_decisions(
@@ -104,6 +179,7 @@ def select_paired_decisions(
     observation_atol: float = 0.0,
     image_mae_tolerance: float = 0.0,
     task_name: str | None = None,
+    pairwise_match: bool = False,
 ) -> dict:
     if len(inputs) < 2:
         raise ValueError("At least two independently sampled rollout roots are required")
@@ -157,16 +233,60 @@ def select_paired_decisions(
         for seed, row in root_rows.items():
             groups[seed].append(row)
 
-    selected_groups = {
+    mixed_groups = {
         seed: rows
         for seed, rows in groups.items()
         if {bool(row["manifest"].get("success")) for row in rows} == {False, True}
     }
-    if not selected_groups:
+    if not mixed_groups:
         raise ValueError("No state group contains both successful and failed actions")
-    if balance_outcomes:
-        balanced_groups = {}
-        for seed, rows in selected_groups.items():
+    if pairwise_match and not balance_outcomes:
+        raise ValueError("pairwise_match requires balance_outcomes=True")
+    if pairwise_match:
+        selected_groups = {}
+        for seed, rows in mixed_groups.items():
+            successes = sorted(
+                (row for row in rows if row["manifest"].get("success")),
+                key=lambda row: row["source"],
+            )
+            failures = sorted(
+                (row for row in rows if not row["manifest"].get("success")),
+                key=lambda row: row["source"],
+            )
+            pairs = _minimum_cost_pairs(
+                successes,
+                failures,
+                numeric_atol=observation_atol,
+                image_mae_tolerance=image_mae_tolerance,
+            )
+            if not pairs:
+                continue
+            selected_rows = []
+            for pair_index, (success, failure, numeric, image) in enumerate(pairs):
+                pair_id = f"{seed}:{pair_index}"
+                success["_pair"] = {
+                    "id": pair_id,
+                    "role": "positive",
+                    "counterpart": failure["source"],
+                    "numeric_max_abs": numeric,
+                    "image_mae_max": image,
+                }
+                failure["_pair"] = {
+                    "id": pair_id,
+                    "role": "negative",
+                    "counterpart": success["source"],
+                    "numeric_max_abs": numeric,
+                    "image_mae_max": image,
+                }
+                selected_rows.extend((success, failure))
+            selected_groups[seed] = selected_rows
+        if not selected_groups:
+            raise ValueError(
+                "No mixed-outcome pair satisfies pairing tolerance"
+            )
+    elif balance_outcomes:
+        selected_groups = {}
+        for seed, rows in mixed_groups.items():
             successes = sorted(
                 (row for row in rows if row["manifest"].get("success")),
                 key=lambda row: row["source"],
@@ -176,8 +296,9 @@ def select_paired_decisions(
                 key=lambda row: row["source"],
             )
             count = min(len(successes), len(failures))
-            balanced_groups[seed] = successes[:count] + failures[:count]
-        selected_groups = balanced_groups
+            selected_groups[seed] = successes[:count] + failures[:count]
+    else:
+        selected_groups = mixed_groups
 
     temporary = output.with_name(f".{output.name}.tmp")
     shutil.rmtree(temporary, ignore_errors=True)
@@ -195,32 +316,47 @@ def select_paired_decisions(
             action_digests: set[str] = set()
             outcomes = []
             for row in rows:
-                observation, action_digest = _load_arrays(row["npz"])
-                if reference_observation is None:
-                    reference_observation = observation
-                elif not _observations_match(
-                    reference_observation,
-                    observation,
-                    numeric_atol=observation_atol,
-                    image_mae_tolerance=image_mae_tolerance,
-                ):
-                    raise ValueError(
-                        f"Selected observations exceed pairing tolerance for seed {seed}"
-                    )
+                observation, action_digest = row.get("_loaded_arrays") or _load_arrays(
+                    row["npz"]
+                )
+                if not pairwise_match:
+                    if reference_observation is None:
+                        reference_observation = observation
+                    elif not _observations_match(
+                        reference_observation,
+                        observation,
+                        numeric_atol=observation_atol,
+                        image_mae_tolerance=image_mae_tolerance,
+                    ):
+                        raise ValueError(
+                            f"Selected observations exceed pairing tolerance for seed {seed}"
+                        )
                 action_digests.add(action_digest)
                 outcomes.append(bool(row["manifest"].get("success")))
             if len(action_digests) < 2:
                 raise ValueError(f"All sampled actions are identical for seed {seed}")
 
-            group_summaries.append(
-                {
-                    "seed": seed,
-                    "samples": len(rows),
-                    "successes": sum(outcomes),
-                    "failures": len(outcomes) - sum(outcomes),
-                    "unique_actions": len(action_digests),
-                }
-            )
+            group_summary = {
+                "seed": seed,
+                "samples": len(rows),
+                "successes": sum(outcomes),
+                "failures": len(outcomes) - sum(outcomes),
+                "unique_actions": len(action_digests),
+            }
+            if pairwise_match:
+                pair_values = [row["_pair"] for row in rows]
+                group_summary.update(
+                    {
+                        "matched_pairs": len(rows) // 2,
+                        "numeric_max_abs": max(
+                            pair["numeric_max_abs"] for pair in pair_values
+                        ),
+                        "image_mae_max": max(
+                            pair["image_mae_max"] for pair in pair_values
+                        ),
+                    }
+                )
+            group_summaries.append(group_summary)
             for row in rows:
                 original = row["manifest"]
                 success = bool(original.get("success"))
@@ -250,6 +386,18 @@ def select_paired_decisions(
                         "paired_original_decision_index": decision_index,
                     }
                 )
+                if pairwise_match:
+                    metadata.update(
+                        {
+                            "paired_match_id": row["_pair"]["id"],
+                            "paired_match_role": row["_pair"]["role"],
+                            "paired_counterpart_source": row["_pair"]["counterpart"],
+                            "paired_numeric_max_abs": row["_pair"][
+                                "numeric_max_abs"
+                            ],
+                            "paired_image_mae_max": row["_pair"]["image_mae_max"],
+                        }
+                    )
                 manifest = {
                     **original,
                     "episode_id": episode_id,
@@ -289,9 +437,11 @@ def select_paired_decisions(
             "decision_index": decision_index,
             "task_name": task_name,
             "balance_outcomes": balance_outcomes,
+            "pairwise_match": pairwise_match,
             "observation_atol": observation_atol,
             "image_mae_tolerance": image_mae_tolerance,
             "all_environment_seeds": len(groups),
+            "candidate_mixed_outcome_seeds": len(mixed_groups),
             "mixed_outcome_seeds": len(selected_groups),
             "episodes": len(episodes),
             "positive": positive,
@@ -316,6 +466,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decision-index", type=int, default=0)
     parser.add_argument("--task")
     parser.add_argument("--balance-outcomes", action="store_true")
+    parser.add_argument(
+        "--pairwise-match",
+        action="store_true",
+        help="match only closest tolerance-valid success/failure pairs",
+    )
     parser.add_argument("--observation-atol", type=float, default=0.0)
     parser.add_argument("--image-mae-tolerance", type=float, default=0.0)
     return parser.parse_args()
@@ -335,6 +490,7 @@ def main() -> None:
         observation_atol=args.observation_atol,
         image_mae_tolerance=args.image_mae_tolerance,
         task_name=args.task,
+        pairwise_match=args.pairwise_match,
     )
     print(json.dumps(summary, ensure_ascii=False))
 

@@ -17,6 +17,11 @@ def main() -> None:
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--observation-atol", type=float, default=0.0)
     parser.add_argument("--image-mae-tolerance", type=float, default=0.0)
+    parser.add_argument(
+        "--pairwise-match",
+        action="store_true",
+        help="retain only tolerance-valid matched success/failure pairs",
+    )
     parser.add_argument("--minimum-positive", type=int, default=1)
     args = parser.parse_args()
     if args.output_root.exists():
@@ -45,6 +50,7 @@ def main() -> None:
                 balance_outcomes=True,
                 observation_atol=args.observation_atol,
                 image_mae_tolerance=args.image_mae_tolerance,
+                pairwise_match=args.pairwise_match,
             )
         except ValueError as error:
             message = str(error)
@@ -53,6 +59,7 @@ def main() -> None:
                 continue
             if (
                 "exceed pairing tolerance" in message
+                or "pair satisfies pairing tolerance" in message
                 or "Task mismatch" in message
                 or "identical" in message
             ):

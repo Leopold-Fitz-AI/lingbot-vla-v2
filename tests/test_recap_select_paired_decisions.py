@@ -3,6 +3,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import numpy as np
+import pytest
 
 from scripts.recap_select_paired_decisions import select_paired_decisions
 
@@ -95,6 +96,55 @@ def test_task_filter_prevents_cross_task_seed_collisions():
         )
         assert summary["task_name"] == "click_bell"
         assert summary["episodes"] == 2
+
+
+def test_pairwise_mode_keeps_only_tolerance_valid_counterfactual_pairs():
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        left = _write_episode(
+            root, source="left", seed=1, success=True, action=1, observation=1
+        )
+        right = _write_episode(
+            root, source="right", seed=1, success=False, action=2, observation=1
+        )
+        outlier = _write_episode(
+            root, source="outlier", seed=1, success=True, action=3, observation=2
+        )
+        output = root / "selected"
+        summary = select_paired_decisions(
+            [left, right, outlier],
+            output,
+            balance_outcomes=True,
+            pairwise_match=True,
+        )
+        assert summary["candidate_mixed_outcome_seeds"] == 1
+        assert summary["mixed_outcome_seeds"] == 1
+        assert summary["positive"] == summary["negative"] == 1
+        assert summary["groups"][0]["matched_pairs"] == 1
+        manifests = [json.loads(path.read_text()) for path in output.glob("*/manifest.json")]
+        assert {item["metadata"]["paired_rollout_source"] for item in manifests} == {
+            "left",
+            "right",
+        }
+        assert len({item["metadata"]["paired_match_id"] for item in manifests}) == 1
+
+
+def test_pairwise_mode_rejects_when_no_cross_outcome_observations_match():
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        left = _write_episode(
+            root, source="left", seed=1, success=True, action=1, observation=1
+        )
+        right = _write_episode(
+            root, source="right", seed=1, success=False, action=2, observation=2
+        )
+        with pytest.raises(ValueError, match="pair satisfies pairing tolerance"):
+            select_paired_decisions(
+                [left, right],
+                root / "selected",
+                balance_outcomes=True,
+                pairwise_match=True,
+            )
 
 
 def test_rejects_nonidentical_observations_within_state_group():

@@ -166,14 +166,18 @@ python scripts/recap_select_paired_decisions.py \
   --input /path/to/branch-602 \
   --output /path/to/paired \
   --decision-index 1 \
-  --balance-outcomes
+  --balance-outcomes \
+  --pairwise-match
 ```
 
-Exact observation equality is the default. Runs collected on different GPUs
-can exhibit tiny numerical drift before the branch point; tolerances may be
-specified explicitly with `--observation-atol` and
-`--image-mae-tolerance`, but their values must be recorded and audited. Prefer
-sequential collection on one GPU when practical.
+Exact observation equality is the default. `--pairwise-match` computes a
+maximum-cardinality, minimum-drift bipartite matching and retains only
+success/failure pairs that individually satisfy the observation tolerances; an
+outlier branch can no longer invalidate an otherwise causal pair. Runs
+collected on different GPUs can exhibit tiny numerical drift before the branch
+point; tolerances may be specified explicitly with `--observation-atol` and
+`--image-mae-tolerance`, but their values and per-pair maxima must be recorded
+and audited. Prefer sequential collection on one GPU when practical.
 
 ## Rollout episode interchange format
 
@@ -486,8 +490,9 @@ reference run may have skipped during environment initialization. A frozen
 `--recap_instruction_map` remains available when it is known to cover every
 valid seed. Thus every branch varies the planned action while reusing exactly
 the same task instruction. Use
-`scripts/recap_select_task_pairs.py` to select balanced mixed-outcome groups per
-task. Tasks with no mixed group must collect another candidate decision or
+`scripts/recap_select_task_pairs.py --pairwise-match` to select balanced,
+tolerance-valid mixed-outcome pairs per task. Tasks with no mixed group must
+collect another candidate decision or
 continuation schedule; they must not receive outcome-BC labels.
 
 ## Recommended experiment
