@@ -41,6 +41,7 @@ from lingbotvla.recap.cfg import (
     combine_cfg_velocity_batch,
     duplicate_cfg_denoise_inputs,
 )
+from lingbotvla.recap.loss import masked_action_loss
 from lingbotvla.ops.triton_moe_loss import triton_sequence_wise_balance_loss
 from lingbotvla.models.vla.lingbot_vla.qwen2_action_expert import (
     Qwen2ForCausalLM,
@@ -1483,19 +1484,13 @@ class LingbotVlaV2Policy(PreTrainedModel):
             recap_condition_id=recap_condition_id,
         )
 
-        if joint_mask is not None:
-            if "repeat" in self.config.loss_type:
-                joint_mask = joint_mask.repeat(2, 1, 1)
-            assert len(joint_mask.shape) == 3
-            
-            masked_losses = losses * joint_mask
-            valid_counts = joint_mask.sum(dim=(1, 2)).clamp(min=1)
-            batch_mean_losses = masked_losses.sum(dim=(1, 2)) / valid_counts
-            loss_vla = masked_losses.sum() / joint_mask.sum().clamp(min=1)
-        else:
-            losses = losses[:, :, : self.config.action_dim]
-            batch_mean_losses = losses.mean(dim=(1, 2))
-            loss_vla = losses.mean()
+        loss_vla, batch_mean_losses = masked_action_loss(
+            losses,
+            action_dim=self.config.action_dim,
+            joint_mask=joint_mask,
+            action_is_pad=action_is_pad,
+            repeated_loss="repeat" in self.config.loss_type,
+        )
 
         loss_dict["batch_mean_losses"] = batch_mean_losses.detach()
         total_loss = (
