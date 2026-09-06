@@ -129,6 +129,36 @@ def test_pairwise_mode_keeps_only_tolerance_valid_counterfactual_pairs():
         assert len({item["metadata"]["paired_match_id"] for item in manifests}) == 1
 
 
+def test_pairwise_mode_caps_pseudoreplicates_per_state():
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        inputs = []
+        for source, success, action in (
+            ("positive-a", True, 1),
+            ("positive-b", True, 2),
+            ("negative-a", False, 3),
+            ("negative-b", False, 4),
+        ):
+            inputs.append(
+                _write_episode(
+                    root,
+                    source=source,
+                    seed=1,
+                    success=success,
+                    action=action,
+                )
+            )
+        summary = select_paired_decisions(
+            inputs,
+            root / "selected",
+            balance_outcomes=True,
+            pairwise_match=True,
+            maximum_pairs_per_state=1,
+        )
+        assert summary["groups"][0]["matched_pairs"] == 1
+        assert summary["positive"] == summary["negative"] == 1
+
+
 def test_pairwise_mode_rejects_when_no_cross_outcome_observations_match():
     with TemporaryDirectory() as directory:
         root = Path(directory)

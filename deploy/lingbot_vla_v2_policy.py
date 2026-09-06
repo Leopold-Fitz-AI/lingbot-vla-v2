@@ -36,6 +36,7 @@ from lingbotvla.recap.adapter import (
     load_recap_adapter_registry,
 )
 from lingbotvla.recap.conditioning import normalize_recap_condition
+from lingbotvla.recap.noise import policy_action_seed
 import time
 import random
 
@@ -244,6 +245,7 @@ class LingbotVLAv2Server:
         recap_condition_start_decision=0,
         policy_seed=42,
         continuation_policy_seed=None,
+        common_noise_per_episode=False,
         counterfactual_policy_decision=0,
         counterfactual_policy_decision_map=None,
         recap_adapter_path=None,
@@ -259,6 +261,10 @@ class LingbotVLAv2Server:
         self.recap_cfg_scale = float(recap_cfg_scale)
         self.recap_condition_decisions = int(recap_condition_decisions)
         self.recap_condition_start_decision = int(recap_condition_start_decision)
+        self.active_recap_condition_decisions = self.recap_condition_decisions
+        self.active_recap_condition_start_decision = (
+            self.recap_condition_start_decision
+        )
         if self.recap_condition_start_decision < 0:
             raise ValueError("recap_condition_start_decision must be non-negative")
         self.policy_seed = int(policy_seed)
@@ -267,6 +273,9 @@ class LingbotVLAv2Server:
             if continuation_policy_seed is None
             else int(continuation_policy_seed)
         )
+        self.common_noise_per_episode = bool(common_noise_per_episode)
+        self.active_environment_seed = None
+        self.active_task_name = None
         self.counterfactual_policy_decision = int(counterfactual_policy_decision)
         if self.counterfactual_policy_decision < 0:
             raise ValueError("counterfactual_policy_decision must be non-negative")
@@ -518,10 +527,18 @@ class LingbotVLAv2Server:
 
     def activate_recap_task(self, task_name):
         if self.recap_adapter_registry is None:
+            self.active_recap_condition_start_decision = (
+                self.recap_condition_start_decision
+            )
+            self.active_recap_condition_decisions = self.recap_condition_decisions
             return
         task_name = None if task_name is None else str(task_name)
         if task_name == self.active_recap_task:
             return
+        self.active_recap_condition_start_decision = (
+            self.recap_condition_start_decision
+        )
+        self.active_recap_condition_decisions = self.recap_condition_decisions
         self.active_recap_task = task_name
         self.active_recap_adapter = False
         entry = self.recap_adapter_registry["tasks"].get(task_name)
@@ -532,10 +549,30 @@ class LingbotVLAv2Server:
             )
             return
         self.load_recap_adapter_weights(entry["path"])
+        self.active_recap_condition_start_decision = int(
+            entry.get(
+                "condition_start_decision",
+                self.recap_condition_start_decision,
+            )
+        )
+        self.active_recap_condition_decisions = int(
+            entry.get("condition_decisions", self.recap_condition_decisions)
+        )
         self.active_recap_adapter = True
-        print(f"Activated RECAP adapter for task {task_name!r}", flush=True)
+        print(
+            f"Activated RECAP adapter for task {task_name!r}; condition window "
+            f"start={self.active_recap_condition_start_decision}, "
+            f"count={self.active_recap_condition_decisions}",
+            flush=True,
+        )
 
-    def reset(self, robo_name, path_to_pi_model = None, task_name=None) -> None:
+    def reset(
+        self,
+        robo_name,
+        path_to_pi_model=None,
+        task_name=None,
+        environment_seed=None,
+    ) -> None:
         if path_to_pi_model is not None:
             self.active_recap_task = None
             self.active_recap_adapter = self.recap_adapter_registry is None
@@ -559,7 +596,15 @@ class LingbotVLAv2Server:
             self.active_counterfactual_policy_decision = (
                 self.counterfactual_policy_decision
             )
+        self.active_task_name = None if task_name is None else str(task_name)
         self.activate_recap_task(task_name)
+        self.active_environment_seed = (
+            None if environment_seed is None else int(environment_seed)
+        )
+        if self.common_noise_per_episode and self.active_environment_seed is None:
+            raise ValueError(
+                "Per-episode common noise requires environment_seed at reset"
+            )
         self.global_step = 0
         self.last_action_chunk = None
         self.last_normalized_action_chunk = None
@@ -660,13 +705,15 @@ class LingbotVLAv2Server:
     def _infer_batch(self, observations, return_normalized=False):
         if not isinstance(observations, (list, tuple)) or len(observations) == 0:
             raise ValueError("batch observation must be a non-empty list")
-        condition_offset = self.global_step - self.recap_condition_start_decision
+        condition_offset = (
+            self.global_step - self.active_recap_condition_start_decision
+        )
         adapter_available = (
             self.recap_adapter_registry is None or self.active_recap_adapter
         )
         condition_active = adapter_available and condition_offset >= 0 and (
-            self.recap_condition_decisions == -1
-            or condition_offset < self.recap_condition_decisions
+            self.active_recap_condition_decisions == -1
+            or condition_offset < self.active_recap_condition_decisions
         )
         effective_condition = self.recap_condition if condition_active else "null"
         cfg_active = self.recap_cfg_scale != 1.0 and condition_active
@@ -708,15 +755,18 @@ class LingbotVLAv2Server:
             ):
                 raise ValueError("RECAP positive and null prompts must use equal padded token lengths")
 
-        if self.continuation_policy_seed is not None:
-            # Counterfactual collection varies only one sampled action.
-            # Every branch otherwise shares the same per-decision noise schedule,
-            # removing future policy noise as an outcome confounder.
-            action_seed = (
-                self.policy_seed
-                if self.global_step == self.active_counterfactual_policy_decision
-                else self.continuation_policy_seed + self.global_step
-            )
+        action_seed = policy_action_seed(
+            policy_seed=self.policy_seed,
+            continuation_policy_seed=self.continuation_policy_seed,
+            counterfactual_decision=self.active_counterfactual_policy_decision,
+            decision_index=self.global_step,
+            task_name=self.active_task_name,
+            environment_seed=self.active_environment_seed,
+            per_episode=self.common_noise_per_episode,
+        )
+        if action_seed is not None:
+            # Conditions share random numbers for a task/environment/decision,
+            # while per-episode mode avoids replaying one noise path everywhere.
             torch.manual_seed(action_seed)
             torch.cuda.manual_seed_all(action_seed)
 
@@ -748,6 +798,7 @@ class LingbotVLAv2Server:
                     else None
                 ),
                 task_name=observation.get('task_name'),
+                environment_seed=observation.get('environment_seed'),
             )
             return dict(action = None)
 
@@ -886,6 +937,14 @@ def main():
         help="Common per-decision noise schedule after the first counterfactual action.",
     )
     parser.add_argument(
+        "--common_noise_per_episode",
+        action="store_true",
+        help=(
+            "Hash task/environment/decision into common action-noise seeds so "
+            "paired conditions match without reusing one path in every episode."
+        ),
+    )
+    parser.add_argument(
         "--counterfactual_policy_decision",
         type=int,
         default=0,
@@ -949,6 +1008,7 @@ def main():
         recap_condition_start_decision=args.recap_condition_start_decision,
         policy_seed=args.policy_seed,
         continuation_policy_seed=args.continuation_policy_seed,
+        common_noise_per_episode=args.common_noise_per_episode,
         counterfactual_policy_decision=args.counterfactual_policy_decision,
         counterfactual_policy_decision_map=args.counterfactual_policy_decision_map,
         recap_adapter_path=args.recap_adapter_path,

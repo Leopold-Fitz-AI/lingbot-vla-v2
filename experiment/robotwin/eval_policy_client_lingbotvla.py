@@ -28,6 +28,7 @@ current_file_path = os.path.abspath(__file__)
 parent_directory = os.path.dirname(current_file_path)
 _INSTRUCTION_MAP_CACHE = {}
 _DECISION_MAP_CACHE = {}
+_ENVIRONMENT_SEED_MAP_CACHE = {}
 
 
 def deterministic_instructions_enabled():
@@ -69,6 +70,33 @@ def mapped_counterfactual_decision(task_name):
     if task_name not in _DECISION_MAP_CACHE[path]:
         raise ValueError(f"Decision map has no entry for task={task_name!r}")
     return int(_DECISION_MAP_CACHE[path][task_name])
+
+
+def mapped_environment_seeds(task_name):
+    path = os.environ.get("RECAP_ENVIRONMENT_SEED_MAP", "").strip()
+    if not path:
+        return None
+    if path not in _ENVIRONMENT_SEED_MAP_CACHE:
+        with open(path) as handle:
+            payload = json.load(handle)
+        if payload.get("schema_version") != 1 or not isinstance(
+            payload.get("tasks"), dict
+        ):
+            raise ValueError(
+                "Environment seed map must have schema_version=1 and a tasks object"
+            )
+        _ENVIRONMENT_SEED_MAP_CACHE[path] = payload["tasks"]
+    seeds = _ENVIRONMENT_SEED_MAP_CACHE[path].get(task_name)
+    if not isinstance(seeds, list) or not seeds:
+        raise ValueError(f"Environment seed map has no seeds for task={task_name!r}")
+    if any(
+        not isinstance(seed, int) or isinstance(seed, bool) or seed < 0
+        for seed in seeds
+    ):
+        raise ValueError(f"Environment seed map for task={task_name!r} is invalid")
+    if len(set(seeds)) != len(seeds):
+        raise ValueError(f"Environment seed map for task={task_name!r} has duplicates")
+    return list(seeds)
 
 
 def mapped_task_instruction(task_name, seed):
@@ -250,16 +278,18 @@ def main(usr_args):
     from script.deploy.websocket_client_policy import WebsocketClientPolicy
     model = WebsocketClientPolicy(port=usr_args['port'])
 
-    st_seed, suc_num = eval_policy(task_name,
-                                   TASK_ENV,
-                                   args,
-                                   model,
-                                   st_seed,
-                                   test_num=test_num,
-                                   video_size=video_size,
-                                   video_fps=video_fps,
-                                   instruction_type=instruction_type,
-                                   usr_args=usr_args)
+    st_seed, suc_num, episode_outcomes = eval_policy(
+        task_name,
+        TASK_ENV,
+        args,
+        model,
+        st_seed,
+        test_num=test_num,
+        video_size=video_size,
+        video_fps=video_fps,
+        instruction_type=instruction_type,
+        usr_args=usr_args,
+    )
     suc_nums.append(suc_num)
 
     topk_success_rate = sorted(suc_nums, reverse=True)[:topk]
@@ -271,7 +301,27 @@ def main(usr_args):
         # file.write(str(task_reward) + '\n')
         file.write("\n".join(map(str, np.array(suc_nums) / test_num)))
 
-    print(f"Data has been saved to {file_path}")
+    result_payload = {
+        "schema_version": 1,
+        "timestamp": current_time,
+        "task": task_name,
+        "task_config": args["task_config"],
+        "instruction_type": instruction_type,
+        "seed_index": int(usr_args.get("seed", 0)),
+        "success": int(suc_num),
+        "episodes": int(test_num),
+        "success_rate": float(suc_num / test_num),
+        "episode_outcomes": episode_outcomes,
+    }
+    result_path = Path(save_dir) / "_result.json"
+    temporary_result = result_path.with_suffix(".json.tmp")
+    with temporary_result.open("w", encoding="utf-8") as handle:
+        json.dump(result_payload, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary_result, result_path)
+    print(f"Data has been saved to {file_path} and {result_path}")
     # return task_reward
 
 
@@ -306,12 +356,25 @@ def eval_policy(task_name,
     # reset_func = eval_function_decorator(policy_name, "reset_model")
 
     now_seed = st_seed
+    fixed_environment_seeds = mapped_environment_seeds(task_name)
+    if fixed_environment_seeds is not None and len(fixed_environment_seeds) != test_num:
+        raise ValueError(
+            f"Environment seed map for task={task_name!r} contains "
+            f"{len(fixed_environment_seeds)} seeds, expected test_num={test_num}"
+        )
+    setup_retries = int(os.environ.get("RECAP_SETUP_RETRIES", "3"))
+    if setup_retries < 0:
+        raise ValueError("RECAP_SETUP_RETRIES must be non-negative")
+    setup_failures = {}
+    episode_outcomes = []
     task_total_reward = 0
     clear_cache_freq = args["clear_cache_freq"]
 
     args["eval_mode"] = True
 
     while succ_seed < test_num:
+        if fixed_environment_seeds is not None:
+            now_seed = fixed_environment_seeds[succ_seed]
         render_freq = args["render_freq"]
         args["render_freq"] = 0
 
@@ -321,21 +384,30 @@ def eval_policy(task_name,
                 episode_info = TASK_ENV.play_once()
                 TASK_ENV.close_env()
             except UnStableError as e:
-                # print(" -------------")
-                # print("Error: ", e)
-                # print(" -------------")
                 TASK_ENV.close_env()
-                now_seed += 1
                 args["render_freq"] = render_freq
+                if fixed_environment_seeds is None:
+                    now_seed += 1
+                else:
+                    setup_failures[now_seed] = setup_failures.get(now_seed, 0) + 1
+                    if setup_failures[now_seed] > setup_retries:
+                        raise RuntimeError(
+                            f"Fixed environment seed {now_seed} remained unstable "
+                            f"after {setup_retries + 1} attempts"
+                        ) from e
                 continue
             except Exception as e:
-                # stack_trace = traceback.format_exc()
-                # print(" -------------")
-                # print("Error: ", e)
-                # print(" -------------")
                 TASK_ENV.close_env()
-                now_seed += 1
                 args["render_freq"] = render_freq
+                if fixed_environment_seeds is None:
+                    now_seed += 1
+                else:
+                    setup_failures[now_seed] = setup_failures.get(now_seed, 0) + 1
+                    if setup_failures[now_seed] > setup_retries:
+                        raise RuntimeError(
+                            f"Fixed environment seed {now_seed} failed setup "
+                            f"after {setup_retries + 1} attempts"
+                        ) from e
                 print(f"error occurs ! {e}")
                 continue
 
@@ -343,13 +415,36 @@ def eval_policy(task_name,
             succ_seed += 1
             suc_test_seed_list.append(now_seed)
         else:
-            now_seed += 1
             args["render_freq"] = render_freq
+            if fixed_environment_seeds is None:
+                now_seed += 1
+            else:
+                setup_failures[now_seed] = setup_failures.get(now_seed, 0) + 1
+                if setup_failures[now_seed] > setup_retries:
+                    raise RuntimeError(
+                        f"Fixed environment seed {now_seed} failed expert validation "
+                        f"after {setup_retries + 1} attempts"
+                    )
             continue
 
         args["render_freq"] = render_freq
 
-        TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
+        try:
+            TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
+        except Exception as error:
+            TASK_ENV.close_env()
+            succ_seed -= 1
+            suc_test_seed_list.pop()
+            if fixed_environment_seeds is None:
+                now_seed += 1
+            else:
+                setup_failures[now_seed] = setup_failures.get(now_seed, 0) + 1
+                if setup_failures[now_seed] > setup_retries:
+                    raise RuntimeError(
+                        f"Fixed environment seed {now_seed} failed rollout setup "
+                        f"after {setup_retries + 1} attempts"
+                    ) from error
+            continue
         episode_info_list = [episode_info["info"]]
         deterministic_instructions = deterministic_instructions_enabled()
         if deterministic_instructions:
@@ -452,6 +547,12 @@ def eval_policy(task_name,
                     "instruction_overridden": instruction_source != "random",
                     "instruction_source": instruction_source,
                     "instruction_map": os.environ.get("RECAP_TASK_INSTRUCTION_MAP"),
+                    "environment_seed_map": os.environ.get(
+                        "RECAP_ENVIRONMENT_SEED_MAP"
+                    ),
+                    "common_noise_per_episode": os.environ.get(
+                        "RECAP_COMMON_NOISE_PER_EPISODE"
+                    ),
                     "step_limit": TASK_ENV.step_lim,
                 },
             )
@@ -495,6 +596,7 @@ def eval_policy(task_name,
                 robo_name=usr_args['robo_name'],
                 path_to_pi_model=path_to_pi_model,
                 task_name=task_name,
+                environment_seed=now_seed,
             )
         )
         
@@ -592,6 +694,9 @@ def eval_policy(task_name,
             print(f"Video saved: {new_name}")
 
 
+        episode_outcomes.append(
+            {"seed": int(now_seed), "success": bool(succ), "instruction": str(instruction)}
+        )
         if succ:
             TASK_ENV.suc += 1
             print("\033[92mSuccess!\033[0m")
@@ -613,7 +718,7 @@ def eval_policy(task_name,
         # TASK_ENV._take_picture()
         now_seed += 1
 
-    return now_seed, TASK_ENV.suc
+    return now_seed, TASK_ENV.suc, episode_outcomes
 
 
 def parse_args_and_config():

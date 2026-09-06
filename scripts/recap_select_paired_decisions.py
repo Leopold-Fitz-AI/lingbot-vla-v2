@@ -113,6 +113,7 @@ def _minimum_cost_pairs(
     *,
     numeric_atol: float,
     image_mae_tolerance: float,
+    maximum_pairs: int | None = None,
 ) -> list[tuple[dict, dict, float, float]]:
     """Return a maximum-cardinality, minimum-drift bipartite matching."""
 
@@ -140,6 +141,8 @@ def _minimum_cost_pairs(
                 candidates[(success_index, failure_index)] = differences
 
     maximum = min(len(successes), len(failures))
+    if maximum_pairs is not None:
+        maximum = min(maximum, maximum_pairs)
     for count in range(maximum, 0, -1):
         options = []
         for success_indices in itertools.combinations(range(len(successes)), count):
@@ -180,11 +183,16 @@ def select_paired_decisions(
     image_mae_tolerance: float = 0.0,
     task_name: str | None = None,
     pairwise_match: bool = False,
+    maximum_pairs_per_state: int | None = None,
 ) -> dict:
     if len(inputs) < 2:
         raise ValueError("At least two independently sampled rollout roots are required")
     if output.exists():
         raise FileExistsError(f"Output already exists: {output}")
+    if maximum_pairs_per_state is not None and maximum_pairs_per_state <= 0:
+        raise ValueError("maximum_pairs_per_state must be positive when provided")
+    if maximum_pairs_per_state is not None and not pairwise_match:
+        raise ValueError("maximum_pairs_per_state requires pairwise_match=True")
 
     groups: dict[int, list[dict]] = defaultdict(list)
     seen_sources: set[str] = set()
@@ -258,6 +266,7 @@ def select_paired_decisions(
                 failures,
                 numeric_atol=observation_atol,
                 image_mae_tolerance=image_mae_tolerance,
+                maximum_pairs=maximum_pairs_per_state,
             )
             if not pairs:
                 continue
@@ -438,6 +447,7 @@ def select_paired_decisions(
             "task_name": task_name,
             "balance_outcomes": balance_outcomes,
             "pairwise_match": pairwise_match,
+            "maximum_pairs_per_state": maximum_pairs_per_state,
             "observation_atol": observation_atol,
             "image_mae_tolerance": image_mae_tolerance,
             "all_environment_seeds": len(groups),
@@ -471,6 +481,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="match only closest tolerance-valid success/failure pairs",
     )
+    parser.add_argument(
+        "--maximum-pairs-per-state",
+        type=int,
+        help="cap matched outcome pairs contributed by one environment state",
+    )
     parser.add_argument("--observation-atol", type=float, default=0.0)
     parser.add_argument("--image-mae-tolerance", type=float, default=0.0)
     return parser.parse_args()
@@ -491,6 +506,7 @@ def main() -> None:
         image_mae_tolerance=args.image_mae_tolerance,
         task_name=args.task,
         pairwise_match=args.pairwise_match,
+        maximum_pairs_per_state=args.maximum_pairs_per_state,
     )
     print(json.dumps(summary, ensure_ascii=False))
 

@@ -152,6 +152,7 @@ bash experiment/robotwin/start_robotwin_infer_and_eval.sh \
   --model_path /path/to/base-checkpoint \
   --policy_seed 600 \
   --continuation_policy_seed 100 \
+  --common_noise_per_episode \
   --counterfactual_policy_decision 1 \
   --recap_rollout_dir /path/to/branch-600
 ```
@@ -167,7 +168,8 @@ python scripts/recap_select_paired_decisions.py \
   --output /path/to/paired \
   --decision-index 1 \
   --balance-outcomes \
-  --pairwise-match
+  --pairwise-match \
+  --maximum-pairs-per-state 2
 ```
 
 Exact observation equality is the default. `--pairwise-match` computes a
@@ -177,7 +179,10 @@ outlier branch can no longer invalidate an otherwise causal pair. Runs
 collected on different GPUs can exhibit tiny numerical drift before the branch
 point; tolerances may be specified explicitly with `--observation-atol` and
 `--image-mae-tolerance`, but their values and per-pair maxima must be recorded
-and audited. Prefer sequential collection on one GPU when practical.
+and audited. Prefer sequential collection on one GPU when practical. Broad
+task selection must enforce independent-state and sample gates, for example
+`--minimum-mixed-states 8 --minimum-positive 16`; repeated actions from one
+state are not independent evidence.
 
 ## Rollout episode interchange format
 
@@ -462,7 +467,9 @@ adapters and deploy them through a checksum-verified registry:
   "tasks": {
     "click_bell": {
       "path": "adapters/click_bell.safetensors",
-      "sha256": "..."
+      "sha256": "...",
+      "condition_start_decision": 1,
+      "condition_decisions": 1
     }
   }
 }
@@ -475,8 +482,10 @@ python -m deploy.lingbot_vla_v2_policy \
   --recap_condition positive
 ```
 
-The RoboTwin client sends the canonical task name at reset. The server swaps
-only the tiny adapter tensors. A task absent from the validated registry is
+The RoboTwin client sends the canonical task name and environment seed at
+reset. The server swaps only the tiny adapter tensors. Registry entries can
+restrict the task adapter to a causal decision window with
+`condition_start_decision` and `condition_decisions`. A task absent from the validated registry is
 forced to null/base even if the server default is positive. This makes already
 perfect tasks and failed validation candidates safe regression guards.
 
@@ -492,8 +501,13 @@ valid seed. Thus every branch varies the planned action while reusing exactly
 the same task instruction. Use
 `scripts/recap_select_task_pairs.py --pairwise-match` to select balanced,
 tolerance-valid mixed-outcome pairs per task. Tasks with no mixed group must
-collect another candidate decision or
-continuation schedule; they must not receive outcome-BC labels.
+collect another candidate decision or continuation schedule; they must not
+receive outcome-BC labels. `--common_noise_per_episode` keeps random numbers
+paired across conditions while varying them by task/environment/decision. For
+validation, build a frozen map with
+`scripts/recap_build_environment_seed_map.py` and pass
+`--recap_environment_seed_map`; fixed seeds are retried and failure is explicit
+instead of silently substituting different seeds.
 
 ## Recommended experiment
 

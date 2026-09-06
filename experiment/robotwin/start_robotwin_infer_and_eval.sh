@@ -33,11 +33,14 @@
 #   --recap_cfg_scale   positive-vs-null flow CFG scale (default: 1.0, disabled)
 #   --policy_seed       action-noise seed for the first inference slot (default: 42)
 #   --continuation_policy_seed common non-branch action-noise schedule (default: disabled)
+#   --common_noise_per_episode hash task/environment/decision into paired noise
 #   --counterfactual_policy_decision decision index varied by policy_seed (default: 0)
 #   --counterfactual_policy_decision_map per-task decision-index JSON
 #   --recap_condition_start_decision first conditioned decision index (default: 0)
 #   --recap_condition_decisions number of conditioned decisions (-1: all after start)
 #   --recap_instruction_map per-task, per-environment-seed instruction JSON
+#   --recap_environment_seed_map exact per-task seed-list JSON for paired evaluation
+#   --recap_setup_retries retries per fixed seed before failing the task
 #   --recap_deterministic_instructions choose task/seed-stable generated instructions
 #   --recap_rollout_dir optional directory for raw RECAP rollout bundles
 #   --keep_inference    keep inference servers resident after simulation
@@ -79,11 +82,14 @@ recap_adapter_registry=""
 recap_cfg_scale="1.0"
 policy_seed=42
 continuation_policy_seed=""
+common_noise_per_episode=false
 counterfactual_policy_decision=0
 counterfactual_policy_decision_map=""
 recap_condition_start_decision=0
 recap_condition_decisions=-1
 recap_instruction_map="${RECAP_TASK_INSTRUCTION_MAP:-}"
+recap_environment_seed_map="${RECAP_ENVIRONMENT_SEED_MAP:-}"
+recap_setup_retries=3
 recap_deterministic_instructions=False
 recap_rollout_dir=""
 robo_name="robotwin"
@@ -119,11 +125,14 @@ while [[ $# -gt 0 ]]; do
         --recap_cfg_scale)   recap_cfg_scale="$2"; shift 2 ;;
         --policy_seed)       policy_seed="$2"; shift 2 ;;
         --continuation_policy_seed) continuation_policy_seed="$2"; shift 2 ;;
+        --common_noise_per_episode) common_noise_per_episode=true; shift ;;
         --counterfactual_policy_decision) counterfactual_policy_decision="$2"; shift 2 ;;
         --counterfactual_policy_decision_map) counterfactual_policy_decision_map="$2"; shift 2 ;;
         --recap_condition_start_decision) recap_condition_start_decision="$2"; shift 2 ;;
         --recap_condition_decisions) recap_condition_decisions="$2"; shift 2 ;;
         --recap_instruction_map) recap_instruction_map="$2"; shift 2 ;;
+        --recap_environment_seed_map) recap_environment_seed_map="$2"; shift 2 ;;
+        --recap_setup_retries) recap_setup_retries="$2"; shift 2 ;;
         --recap_deterministic_instructions) recap_deterministic_instructions=True; shift ;;
         --recap_rollout_dir) recap_rollout_dir="$2"; shift 2 ;;
         --robo_name)         robo_name="$2";         shift 2 ;;
@@ -162,11 +171,14 @@ while [[ $# -gt 0 ]]; do
             echo "  --recap_cfg_scale   positive-vs-null flow CFG scale (default: 1.0)"
             echo "  --policy_seed       action-noise seed for first inference slot (default: 42)"
             echo "  --continuation_policy_seed common non-branch noise seed (disabled by default)"
+            echo "  --common_noise_per_episode vary paired common noise by task/environment"
             echo "  --counterfactual_policy_decision decision index varied by policy_seed (default: 0)"
             echo "  --counterfactual_policy_decision_map per-task decision-index JSON"
             echo "  --recap_condition_start_decision first conditioned decision (default: 0)"
             echo "  --recap_condition_decisions number conditioned (-1: all after start)"
             echo "  --recap_instruction_map per-task, per-seed instruction JSON"
+            echo "  --recap_environment_seed_map exact per-task seed-list JSON"
+            echo "  --recap_setup_retries fixed-seed setup retries before failure (default: 3)"
             echo "  --recap_deterministic_instructions use task/seed-stable generated text"
             echo "  --recap_rollout_dir save raw rollout bundles to this directory"
             echo "  --robo_name         robot config name (default: robotwin)"
@@ -293,6 +305,10 @@ if [ -n "$continuation_policy_seed" ] && ! [[ "$continuation_policy_seed" =~ ^-?
     echo -e "\033[31mError: --continuation_policy_seed must be an integer\033[0m"
     exit 1
 fi
+if [ "$common_noise_per_episode" = true ] && [ -z "$continuation_policy_seed" ]; then
+    echo -e "\033[31mError: --common_noise_per_episode requires --continuation_policy_seed\033[0m"
+    exit 1
+fi
 if ! [[ "$counterfactual_policy_decision" =~ ^[0-9]+$ ]]; then
     echo -e "\033[31mError: --counterfactual_policy_decision must be non-negative\033[0m"
     exit 1
@@ -315,6 +331,14 @@ if [ -n "$recap_instruction_map" ] && [ ! -f "$recap_instruction_map" ]; then
 fi
 if [ -n "$recap_instruction_map" ] && [ "$recap_deterministic_instructions" = True ]; then
     echo -e "\033[31mError: instruction map and deterministic instructions are mutually exclusive\033[0m"
+    exit 1
+fi
+if [ -n "$recap_environment_seed_map" ] && [ ! -f "$recap_environment_seed_map" ]; then
+    echo -e "\033[31mError: --recap_environment_seed_map is not a file: ${recap_environment_seed_map}\033[0m"
+    exit 1
+fi
+if ! [[ "$recap_setup_retries" =~ ^[0-9]+$ ]]; then
+    echo -e "\033[31mError: --recap_setup_retries must be non-negative\033[0m"
     exit 1
 fi
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -403,7 +427,11 @@ cd "$inference_workdir" || { echo -e "\033[31mError: inference workdir ${inferen
 for slot in $(seq 0 $((num_slots-1))); do
     gpu_id=$(( gpu_offset + slot % num_gpus ))
     port=$(( start_port + slot ))
-    slot_policy_seed=$(( policy_seed + slot ))
+    if [ "$common_noise_per_episode" = true ]; then
+        slot_policy_seed=$policy_seed
+    else
+        slot_policy_seed=$(( policy_seed + slot ))
+    fi
 
     export CUDA_VISIBLE_DEVICES=${gpu_id}
 
@@ -420,6 +448,10 @@ for slot in $(seq 0 $((num_slots-1))); do
     continuation_seed_arg=""
     if [ -n "$continuation_policy_seed" ]; then
         continuation_seed_arg="--continuation_policy_seed '${continuation_policy_seed}'"
+    fi
+    common_noise_arg=""
+    if [ "$common_noise_per_episode" = true ]; then
+        common_noise_arg="--common_noise_per_episode"
     fi
     counterfactual_map_arg=""
     if [ -n "$counterfactual_policy_decision_map" ]; then
@@ -439,6 +471,7 @@ for slot in $(seq 0 $((num_slots-1))); do
         --use_compile "${use_compile}" \
         --policy_seed '${slot_policy_seed}' \
         ${continuation_seed_arg} \
+        ${common_noise_arg} \
         ${counterfactual_map_arg} \
         ${recap_adapter_arg} \
         --counterfactual_policy_decision '${counterfactual_policy_decision}' \
@@ -601,10 +634,13 @@ launch_task() {
     RECAP_COUNTERFACTUAL_POLICY_DECISION="${counterfactual_policy_decision}" \
     RECAP_COUNTERFACTUAL_POLICY_DECISION_MAP="${counterfactual_policy_decision_map}" \
     RECAP_TASK_INSTRUCTION_MAP="${recap_instruction_map}" \
+    RECAP_ENVIRONMENT_SEED_MAP="${recap_environment_seed_map}" \
+    RECAP_SETUP_RETRIES="${recap_setup_retries}" \
+    RECAP_COMMON_NOISE_PER_EPISODE="${common_noise_per_episode}" \
     RECAP_DETERMINISTIC_INSTRUCTIONS="${recap_deterministic_instructions}" \
     RECAP_CONDITION_START_DECISION="${recap_condition_start_decision}" \
     RECAP_CONDITION_DECISIONS="${recap_condition_decisions}" \
-    setsid bash -c "source ${conda_sh} && conda activate ${sim_env} && export PYTHONPATH=\"\$(python -c 'import site;print(site.getsitepackages()[0])')\${PYTHONPATH:+:\$PYTHONPATH}\" && PYTHONUNBUFFERED=1 PYTHONWARNINGS=ignore::UserWarning XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 RECAP_POLICY_SEED='${slot_policy_seed}' RECAP_CONTINUATION_POLICY_SEED='${continuation_policy_seed}' RECAP_COUNTERFACTUAL_POLICY_DECISION='${counterfactual_policy_decision}' RECAP_COUNTERFACTUAL_POLICY_DECISION_MAP='${counterfactual_policy_decision_map}' RECAP_TASK_INSTRUCTION_MAP='${recap_instruction_map}' RECAP_DETERMINISTIC_INSTRUCTIONS='${recap_deterministic_instructions}' RECAP_CONDITION_START_DECISION='${recap_condition_start_decision}' RECAP_CONDITION_DECISIONS='${recap_condition_decisions}' python -u ${eval_client_dst} --config policy/${policy_name}/deploy_policy.yml \
+    setsid bash -c "source ${conda_sh} && conda activate ${sim_env} && export PYTHONPATH=\"\$(python -c 'import site;print(site.getsitepackages()[0])')\${PYTHONPATH:+:\$PYTHONPATH}\" && PYTHONUNBUFFERED=1 PYTHONWARNINGS=ignore::UserWarning XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 RECAP_POLICY_SEED='${slot_policy_seed}' RECAP_CONTINUATION_POLICY_SEED='${continuation_policy_seed}' RECAP_COUNTERFACTUAL_POLICY_DECISION='${counterfactual_policy_decision}' RECAP_COUNTERFACTUAL_POLICY_DECISION_MAP='${counterfactual_policy_decision_map}' RECAP_TASK_INSTRUCTION_MAP='${recap_instruction_map}' RECAP_ENVIRONMENT_SEED_MAP='${recap_environment_seed_map}' RECAP_SETUP_RETRIES='${recap_setup_retries}' RECAP_COMMON_NOISE_PER_EPISODE='${common_noise_per_episode}' RECAP_DETERMINISTIC_INSTRUCTIONS='${recap_deterministic_instructions}' RECAP_CONDITION_START_DECISION='${recap_condition_start_decision}' RECAP_CONDITION_DECISIONS='${recap_condition_decisions}' python -u ${eval_client_dst} --config policy/${policy_name}/deploy_policy.yml \
         --overrides \
         --task_name ${task_name} \
         --task_config ${task_config} \

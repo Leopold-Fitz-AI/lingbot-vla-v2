@@ -22,12 +22,20 @@ def main() -> None:
         action="store_true",
         help="retain only tolerance-valid matched success/failure pairs",
     )
+    parser.add_argument(
+        "--maximum-pairs-per-state",
+        type=int,
+        help="cap matched pairs from one environment state",
+    )
+    parser.add_argument("--minimum-mixed-states", type=int, default=1)
     parser.add_argument("--minimum-positive", type=int, default=1)
     args = parser.parse_args()
     if args.output_root.exists():
         raise FileExistsError(f"Output already exists: {args.output_root}")
     if args.minimum_positive <= 0:
         raise ValueError("minimum-positive must be positive")
+    if args.minimum_mixed_states <= 0:
+        raise ValueError("minimum-mixed-states must be positive")
     with args.decision_map.open() as handle:
         decision_map = json.load(handle)
     if decision_map.get("schema_version") != 1 or not isinstance(
@@ -51,6 +59,7 @@ def main() -> None:
                 observation_atol=args.observation_atol,
                 image_mae_tolerance=args.image_mae_tolerance,
                 pairwise_match=args.pairwise_match,
+                maximum_pairs_per_state=args.maximum_pairs_per_state,
             )
         except ValueError as error:
             message = str(error)
@@ -66,7 +75,12 @@ def main() -> None:
                 rejected[task] = message
                 continue
             raise
-        if summary["positive"] < args.minimum_positive:
+        if summary["mixed_outcome_seeds"] < args.minimum_mixed_states:
+            insufficient[task] = (
+                f"only {summary['mixed_outcome_seeds']} independent mixed states; "
+                f"minimum is {args.minimum_mixed_states}"
+            )
+        elif summary["positive"] < args.minimum_positive:
             insufficient[task] = (
                 f"only {summary['positive']} positive samples; "
                 f"minimum is {args.minimum_positive}"
@@ -78,6 +92,11 @@ def main() -> None:
         "schema_version": 1,
         "inputs": [str(path.resolve()) for path in args.input],
         "decision_map": str(args.decision_map.resolve()),
+        "selection_gates": {
+            "minimum_mixed_states": args.minimum_mixed_states,
+            "minimum_positive": args.minimum_positive,
+            "maximum_pairs_per_state": args.maximum_pairs_per_state,
+        },
         "selected_tasks": selected,
         "insufficient_tasks": insufficient,
         "rejected_tasks": rejected,

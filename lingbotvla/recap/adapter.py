@@ -57,6 +57,26 @@ def load_recap_adapter_registry(path: str | Path) -> dict:
         expected_sha256 = entry.get("sha256")
         if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
             raise ValueError(f"Registry entry for {task!r} requires SHA-256")
+        condition_start = entry.get("condition_start_decision")
+        if condition_start is not None and (
+            not isinstance(condition_start, int)
+            or isinstance(condition_start, bool)
+            or condition_start < 0
+        ):
+            raise ValueError(
+                f"Registry entry for {task!r} condition_start_decision "
+                "must be a non-negative integer"
+            )
+        condition_decisions = entry.get("condition_decisions")
+        if condition_decisions is not None and (
+            not isinstance(condition_decisions, int)
+            or isinstance(condition_decisions, bool)
+            or condition_decisions < -1
+        ):
+            raise ValueError(
+                f"Registry entry for {task!r} condition_decisions "
+                "must be -1 or a non-negative integer"
+            )
         artifact = Path(entry["path"])
         if not artifact.is_absolute():
             artifact = registry_path.parent / artifact

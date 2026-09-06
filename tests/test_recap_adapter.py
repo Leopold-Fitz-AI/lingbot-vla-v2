@@ -103,6 +103,8 @@ class RecapAdapterTest(unittest.TestCase):
                             "click_bell": {
                                 "path": artifact.name,
                                 "sha256": digest,
+                                "condition_start_decision": 1,
+                                "condition_decisions": 1,
                             }
                         },
                     }
@@ -113,6 +115,10 @@ class RecapAdapterTest(unittest.TestCase):
                 loaded["tasks"]["click_bell"]["path"], artifact.resolve()
             )
             self.assertEqual(loaded["tasks"]["click_bell"]["sha256"], digest)
+            self.assertEqual(
+                loaded["tasks"]["click_bell"]["condition_start_decision"], 1
+            )
+            self.assertEqual(loaded["tasks"]["click_bell"]["condition_decisions"], 1)
 
             artifact.write_bytes(b"corrupt")
             with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
@@ -141,6 +147,30 @@ class RecapAdapterTest(unittest.TestCase):
             registry = Path(directory) / "registry.json"
             registry.write_text(json.dumps({"schema_version": 2, "tasks": {}}))
             with self.assertRaisesRegex(ValueError, "schema_version"):
+                load_recap_adapter_registry(registry)
+
+    def test_rejects_invalid_registry_condition_window(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "adapter.safetensors"
+            artifact.write_bytes(b"adapter")
+            digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            registry = root / "registry.json"
+            registry.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "tasks": {
+                            "task": {
+                                "path": artifact.name,
+                                "sha256": digest,
+                                "condition_start_decision": -1,
+                            }
+                        },
+                    }
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "non-negative integer"):
                 load_recap_adapter_registry(registry)
 
     def test_rejects_invalid_ids_and_shapes(self):
