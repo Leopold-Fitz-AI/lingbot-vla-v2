@@ -31,6 +31,36 @@ _DECISION_MAP_CACHE = {}
 _ENVIRONMENT_SEED_MAP_CACHE = {}
 
 
+def verified_atomic_write_json(path, payload):
+    """Write JSON through local memory and verify destination bytes."""
+    path = Path(path)
+    encoded = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    token = hashlib.sha256(f"{path}:{os.getpid()}".encode()).hexdigest()[:12]
+    local = Path("/dev/shm") / f".recap-result-{token}.tmp"
+    destination = path.with_name(f".{path.name}.{token}.tmp")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with local.open("wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if hashlib.sha256(local.read_bytes()).hexdigest() != digest:
+            raise IOError(f"Local JSON staging verification failed: {local}")
+        with destination.open("wb") as handle:
+            handle.write(local.read_bytes())
+            handle.flush()
+            os.fsync(handle.fileno())
+        if hashlib.sha256(destination.read_bytes()).hexdigest() != digest:
+            raise IOError(f"Destination JSON staging verification failed: {destination}")
+        os.replace(destination, path)
+        if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            raise IOError(f"Final JSON verification failed: {path}")
+    finally:
+        local.unlink(missing_ok=True)
+        destination.unlink(missing_ok=True)
+
+
 def deterministic_instructions_enabled():
     return os.environ.get("RECAP_DETERMINISTIC_INSTRUCTIONS", "").strip().lower() in {
         "1",
@@ -314,13 +344,12 @@ def main(usr_args):
         "episode_outcomes": episode_outcomes,
     }
     result_path = Path(save_dir) / "_result.json"
-    temporary_result = result_path.with_suffix(".json.tmp")
-    with temporary_result.open("w", encoding="utf-8") as handle:
-        json.dump(result_payload, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary_result, result_path)
+    verified_atomic_write_json(result_path, result_payload)
+    recap_rollout_dir = str(usr_args.get("recap_rollout_dir", "")).strip()
+    if recap_rollout_dir:
+        verified_atomic_write_json(
+            Path(recap_rollout_dir) / f"_{task_name}_result.json", result_payload
+        )
     print(f"Data has been saved to {file_path} and {result_path}")
     # return task_reward
 
