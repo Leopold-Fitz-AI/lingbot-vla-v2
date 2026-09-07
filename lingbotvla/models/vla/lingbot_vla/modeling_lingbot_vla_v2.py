@@ -603,6 +603,7 @@ class FlowMatchingV2(FlowMatchingV1):
     def _apply_recap_velocity_adapter(
         self, suffix_out, velocity, recap_condition_id
     ):
+        self._last_recap_velocity_residual = None
         if not self.recap_adapter_enabled or self.recap_adapter_type != "velocity_lora":
             return velocity
         residual = apply_recap_velocity_lora(
@@ -613,7 +614,9 @@ class FlowMatchingV2(FlowMatchingV1):
             scale=getattr(self.config, "recap_adapter_scale", 1.0),
             signed_axis=getattr(self.config, "recap_signed_velocity_axis", False),
         )
-        return velocity + residual.to(dtype=velocity.dtype)
+        residual = residual.to(dtype=velocity.dtype)
+        self._last_recap_velocity_residual = residual
+        return velocity + residual
 
     def embed_prefix(
         self,
@@ -1493,8 +1496,30 @@ class LingbotVlaV2Policy(PreTrainedModel):
         )
 
         loss_dict["batch_mean_losses"] = batch_mean_losses.detach()
+        residual_loss_weight = float(
+            getattr(self.config, "recap_residual_loss_weight", 0.0)
+        )
+        if residual_loss_weight < 0:
+            raise ValueError("recap_residual_loss_weight must be non-negative")
+        recap_residual_loss = loss_vla.new_zeros(())
+        if residual_loss_weight:
+            residual = getattr(self.model, "_last_recap_velocity_residual", None)
+            if residual is None:
+                raise ValueError(
+                    "recap_residual_loss_weight requires a velocity_lora adapter"
+                )
+            residual_mean_square, _ = masked_action_loss(
+                residual.square(),
+                action_dim=self.config.action_dim,
+                joint_mask=joint_mask,
+                action_is_pad=action_is_pad,
+                repeated_loss=False,
+            )
+            recap_residual_loss = residual_mean_square * residual_loss_weight
+        loss_dict["recap_residual_loss"] = recap_residual_loss.detach()
         total_loss = (
             loss_vla
+            + recap_residual_loss
             + loss_depth
             + loss_future_depth
             + loss_future_video

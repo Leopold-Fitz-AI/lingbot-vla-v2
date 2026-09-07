@@ -99,6 +99,7 @@ class LingbotVLAConfig(PretrainedConfig):
         recap_adapter_scale: float = 1.0,
         recap_adapter_init_std: float = 0.02,
         recap_signed_velocity_axis: bool = False,
+        recap_residual_loss_weight: float = 0.0,
 
         **kwargs
     ):
@@ -115,6 +116,7 @@ class LingbotVLAConfig(PretrainedConfig):
         self.recap_adapter_scale = recap_adapter_scale
         self.recap_adapter_init_std = recap_adapter_init_std
         self.recap_signed_velocity_axis = recap_signed_velocity_axis
+        self.recap_residual_loss_weight = recap_residual_loss_weight
         self.use_cache = False
         self.attention_implementation = attention_implementation
         self.num_steps = 10

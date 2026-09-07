@@ -116,7 +116,8 @@ robot configs, and normalization statistics, see
 | `train.recap_adapter_rank` | int | `8` | Rank of each condition-specific velocity adapter. |
 | `train.recap_adapter_scale` | float | `1.0` | Scale of the adapter residual. |
 | `train.recap_adapter_init_std` | float | `0.02` | Deterministic velocity-LoRA down-projection initialization scale. |
-| `train.recap_signed_velocity_axis` | bool | `False` | Use the positive residual for positive and its exact inverse for negative; null remains zero. Train this mode with causal-positive samples only. |
+| `train.recap_signed_velocity_axis` | bool | `False` | Use the positive residual for positive and its exact inverse for negative; null remains zero. Supports strictly matched positive/negative causal pairs. |
+| `train.recap_residual_loss_weight` | float | `0.0` | L2 penalty on valid, non-padded velocity-adapter residuals; locally approximates a policy-KL trust region. |
 | `train.reset_recap_adapter` | bool | `False` | Reinitialize a newly added adapter after loading base weights. |
 | `train.train_state_proj` | bool | `True` | Whether to train the state projection. |
 | `train.tokenizer_max_length` | int | `48` | Maximum tokenizer length. Current V2 configs often set `72`. |

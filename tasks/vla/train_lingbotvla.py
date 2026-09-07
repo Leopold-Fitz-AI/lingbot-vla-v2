@@ -161,6 +161,10 @@ class MyTrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "Derive negative as the exact inverse of the positive velocity residual."},
     )
+    recap_residual_loss_weight: float = field(
+        default=0.0,
+        metadata={"help": "L2 penalty on the valid velocity-adapter residual."},
+    )
     reset_recap_adapter: bool = field(
         default=False,
         metadata={"help": "Zero the RECAP adapter after loading base weights; use only for a fresh adapter."},
