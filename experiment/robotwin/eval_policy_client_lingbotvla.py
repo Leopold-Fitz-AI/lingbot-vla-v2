@@ -12,6 +12,8 @@ from envs.utils.create_actor import UnStableError
 
 import numpy as np
 from deploy.recap_instructions import INSTRUCTION_PROTOCOL, generate_task_instruction
+from deploy.recap_locked_cohort import CohortProtocolError, PROTOCOL_ERROR_EXIT
+from deploy.recap_evaluator_context import capture_evaluator_context, restore_evaluator_context
 from pathlib import Path
 from collections import deque
 import traceback
@@ -374,7 +376,6 @@ def eval_policy(task_name,
     if recap_rollout_dir:
         from script.deploy.recap_rollout_recorder import RecapEpisodeRecorder
 
-    expert_check = True
     TASK_ENV.suc = 0
     TASK_ENV.test_num = 0
 
@@ -393,10 +394,24 @@ def eval_policy(task_name,
             f"Environment seed map for task={task_name!r} contains "
             f"{len(fixed_environment_seeds)} seeds, expected test_num={test_num}"
         )
+    locked_cohort = None
+    cohort_manifest = os.environ.get("RECAP_COHORT_MANIFEST", "").strip()
+    if cohort_manifest:
+        from deploy.recap_locked_cohort import load_locked_cohort
+        locked_cohort = load_locked_cohort(
+            cohort_manifest, task=task_name, task_config=args["task_config"],
+            seeds=fixed_environment_seeds, count=test_num,
+            instructions=([mapped_task_instruction(task_name, seed) for seed in fixed_environment_seeds]
+                          if fixed_environment_seeds else None),
+        )
+    # Ordinary benchmark runs still perform their legacy live expert check.
+    # A verified locked cohort has already passed this outcome-blind gate.
+    expert_check = locked_cohort is None
     setup_retries = int(os.environ.get("RECAP_SETUP_RETRIES", "3"))
     if setup_retries < 0:
         raise ValueError("RECAP_SETUP_RETRIES must be non-negative")
     setup_failures = {}
+    expert_calls = {}
     episode_outcomes = []
     task_total_reward = 0
     clear_cache_freq = args["clear_cache_freq"]
@@ -412,6 +427,7 @@ def eval_policy(task_name,
         if expert_check:
             try:
                 TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
+                expert_calls[now_seed] = expert_calls.get(now_seed, 0) + 1
                 episode_info = TASK_ENV.play_once()
                 TASK_ENV.close_env()
             except UnStableError as e:
@@ -476,7 +492,9 @@ def eval_policy(task_name,
                         f"after {setup_retries + 1} attempts"
                     ) from error
             continue
-        episode_info_list = [episode_info["info"]]
+        # Locked execution uses the literal, verified preflight instruction;
+        # it must not synthesize new text or call an expert to reconstruct info.
+        episode_info_list = [] if locked_cohort else [episode_info["info"]]
         deterministic_instructions = deterministic_instructions_enabled()
         instruction_override = os.environ.get("RECAP_TASK_INSTRUCTION", "").strip()
         instruction_map_path = os.environ.get(
@@ -521,7 +539,22 @@ def eval_policy(task_name,
             if deterministic_instructions
             else "random"
         )
+        if locked_cohort and instruction != locked_cohort.entries[now_seed]["instruction"]:
+            raise CohortProtocolError("Instruction override conflicts with locked preflight")
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
+
+        initial_observation = None
+        eligibility_metadata = {"eligibility_protocol": "live_expert"}
+        if locked_cohort:
+            context = locked_cohort.entries[now_seed].get("evaluator_context", {})
+            try:
+                restore_evaluator_context(TASK_ENV, task_name, context)
+            except (ValueError, AttributeError, KeyError) as error:
+                raise CohortProtocolError(f"Evaluator context restore failed: {error}") from error
+            initial_observation = TASK_ENV.get_obs()
+            eligibility_metadata = locked_cohort.initial_metadata(now_seed, initial_observation)
+            eligibility_metadata["evaluator_context"] = capture_evaluator_context(TASK_ENV, task_name)
+        eligibility_metadata["expert_rollouts_before_policy"] = expert_calls.get(now_seed, 0)
 
         recap_recorder = None
         if RecapEpisodeRecorder is not None:
@@ -569,6 +602,7 @@ def eval_policy(task_name,
                         "RECAP_COMMON_NOISE_PER_EPISODE"
                     ),
                     "step_limit": TASK_ENV.step_lim,
+                    **eligibility_metadata,
                 },
             )
 
@@ -616,7 +650,8 @@ def eval_policy(task_name,
         )
         
         while TASK_ENV.take_action_cnt<TASK_ENV.step_lim and not succ:
-            observation = TASK_ENV.get_obs()
+            observation = initial_observation if initial_observation is not None else TASK_ENV.get_obs()
+            initial_observation = None
             # from IPython import embed;embed()
             
             formatted_observation = {
@@ -771,4 +806,8 @@ if __name__ == "__main__":
 
     usr_args = parse_args_and_config()
 
-    main(usr_args)
+    try:
+        main(usr_args)
+    except CohortProtocolError:
+        traceback.print_exc()
+        sys.exit(PROTOCOL_ERROR_EXIT)

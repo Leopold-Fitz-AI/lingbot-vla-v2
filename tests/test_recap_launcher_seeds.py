@@ -18,3 +18,16 @@ def test_server_and_recorded_policy_seed_share_slot_rule(common_noise, expected)
         capture_output=True, text=True, check=True,
     )
     assert result.stdout == expected
+
+
+@pytest.mark.parametrize("exit_code,expected", [(1, "retry"), (78, "stop")])
+def test_locked_state_mismatches_are_not_retried(exit_code, expected):
+    source = (Path(__file__).parents[1] / "experiment/robotwin/start_robotwin_infer_and_eval.sh").read_text()
+    condition = next(line.strip() for line in source.splitlines()
+                     if 'task_retries[$task_name]} -lt $max_retries' in line)
+    result = subprocess.run(
+        ["bash", "-c", 'declare -A task_retries=([bell]=1); task_name=bell; max_retries=3; '
+         + f'exit_code={exit_code}; ' + condition + ' echo retry; else echo stop; fi'],
+        capture_output=True, text=True, check=True,
+    )
+    assert result.stdout.strip() == expected

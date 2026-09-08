@@ -24,12 +24,14 @@ import threading
 import time
 from pathlib import Path
 
+from deploy.recap_locked_cohort import LOCKED_COHORT_PROTOCOL, load_locked_cohort
 from lingbotvla.recap.evaluation import (
     final_statistics,
     holm_adjust,
     initial_drift,
     paired_counts,
     power_sensitivity,
+    recorded_initial_hashes,
     sha256,
     validate_runtime,
     write_json,
@@ -41,6 +43,7 @@ PROTOCOL = {"policy_seed": 900, "continuation_policy_seed": 300, "counterfactual
             "common_noise_per_episode": True, "instruction_protocol": "task-seed-v2-fixed-candidates32",
             "task_config": "demo_clean", "use_bf16": False, "use_compile": False,
             "deterministic_algorithms": True, "moe_reduction": "stable_pack_fixed_routing_rank_sum",
+            "eligibility_protocol": LOCKED_COHORT_PROTOCOL,
             "cfg_scale": 1.0, "chunk_size": 50}
 SOURCE_SUFFIXES = {".py", ".sh", ".yaml", ".yml", ".json"}
 
@@ -57,7 +60,52 @@ def code_hash(root):
     return digest.hexdigest()
 
 
-def initialize(study, project, source_repo):
+def inherit_cohorts(study, previous, plan):
+    """Explicit amendment: copy complete consumed cohorts, never policy outcomes."""
+    old = read_json(previous / "plan.json")
+    if sha256(previous / "plan.json") != read_json(previous / "plan_lock.json")["sha256"]:
+        raise ValueError("Predecessor plan changed")
+    if read_json(previous / "status.json")["state"] != "infrastructure_or_protocol_failure":
+        raise ValueError("Predecessor must be stopped on a recorded infrastructure failure")
+    if ((previous / "final_opened.json").exists()
+            or any(p.name not in {"s32", "s42"} for p in (previous / "cohorts").iterdir())
+            or (previous / "evaluations/confirm").exists()):
+        raise ValueError("Cannot reuse confirmation/final cohorts as a recovery diagnostic")
+    for key in ("all_tasks", "target_tasks", "gpus", "task_gpu", "target_gpu", "base_files", "wrapper_sha256",
+                "control", "screen", "confirm", "final", "confirmation_family", "confirmation_holm_alpha",
+                "confirmation_min_delta", "bootstrap_replicates", "bootstrap_seed"):
+        if old[key] != plan[key]:
+            raise ValueError(f"Recovery changed the frozen study design: {key}")
+    if old["protocol"].get("eligibility_protocol") is not None:
+        raise ValueError("This amendment cannot restart an already locked-cohort protocol")
+    if any(plan["protocol"].get(key) != value for key, value in old["protocol"].items()):
+        raise ValueError("Recovery changed the policy numerical protocol")
+    def candidates(data):
+        return {task: [{k: v for k, v in entry.items() if k != "path"} for entry in entries]
+                for task, entries in data["candidates"].items()}
+    if candidates(old) != candidates(plan):
+        raise ValueError("Recovery changed candidate weights/windows/priority")
+    files = []
+    for stage, index in (("control", 32), ("screen", 42)):
+        for task in plan["target_tasks"]:
+            source = previous / "cohorts" / f"s{index}" / task
+            expected = read_json(source / "lock.json")["sha256"]
+            report = read_json(source / "preflight.json")
+            if (sha256(source / "preflight.json") != expected or report["task"] != task
+                    or report["policy_rollouts"] != 0 or report["episodes"] != plan[stage]["episodes_per_index"]):
+                raise ValueError("Predecessor cohort is incomplete or changed")
+            destination = study / "cohorts" / f"s{index}" / task
+            shutil.copytree(source, destination)
+            if sha256(destination / "preflight.json") != expected:
+                raise ValueError("Inherited cohort readback mismatch")
+            files.append({"task": task, "seed_index": index, "preflight_sha256": expected})
+    return {"previous_study": str(previous), "previous_plan_sha256": sha256(previous / "plan.json"),
+            "previous_status_sha256": sha256(previous / "status.json"), "cohorts": files,
+            "policy_results_reused": False, "selection_index_42_already_consumed": True,
+            "reason": "Honor frozen expert eligibility; do not re-screen it during policy execution"}
+
+
+def initialize(study, project, source_repo, inherit_cohorts_from=None):
     if study.exists():
         raise FileExistsError(f"Study already exists: {study}")
     inventory = read_json(project / "outputs/recap_50task_causal_v1/baseline_inventory.json")
@@ -120,6 +168,8 @@ def initialize(study, project, source_repo):
         "scope": "fixed_50_task_macro_improvement_not_every_task_improvement",
         "maximum_policy_episodes_excluding_infra_retries": 8064,
     }
+    if inherit_cohorts_from is not None:
+        plan["cohort_inheritance"] = inherit_cohorts(study, inherit_cohorts_from, plan)
     write_json(study / "plan.json", plan, immutable=True)
     write_json(study / "plan_lock.json", {"sha256": sha256(study / "plan.json")}, immutable=True)
     write_json(study / "power.json", power_sensitivity(), immutable=True)
@@ -138,6 +188,7 @@ class Study:
         self.copy_lock = threading.Lock()
         self.jobs_lock = threading.Lock()
         self.children = set()
+        self.stop_requested = threading.Event()
         self.empty = root / "registries/empty.json"
         self.env = dict(os.environ)
         for key in list(self.env):
@@ -192,6 +243,8 @@ class Study:
         print(f"STUDY {stage}: {state}", flush=True)
 
     def execute(self, command, *, cwd, env, log):
+        if self.stop_requested.is_set():
+            raise concurrent.futures.CancelledError("Study stopped before launch")
         log.parent.mkdir(parents=True, exist_ok=True)
         with log.open("ab") as handle:
             child = subprocess.Popen(command, cwd=cwd, env=env, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)
@@ -204,16 +257,28 @@ class Study:
                     self.children.discard(child)
 
     def parallel(self, jobs):
+        # Report the FIRST failure immediately, not after earlier/other workers
+        # finish. In-flight jobs may drain; no worker may launch another job.
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            futures = [pool.submit(fn, *args) for fn, args in jobs]
-            return [f.result() for f in futures]
+            futures = {pool.submit(fn, *args): index for index, (fn, args) in enumerate(jobs)}
+            results = [None] * len(jobs)
+            try:
+                for future in concurrent.futures.as_completed(futures):
+                    results[futures[future]] = future.result()
+            except BaseException as error:
+                self.stop_requested.set()
+                for future in futures:
+                    future.cancel()
+                self.status("stopping", "infrastructure_or_protocol_failure_waiting_for_workers", error=repr(error))
+                raise
+            return results
 
     def sync_sim(self):
         sim = Path(self.plan["eval_workdir"]) / "script"
         (sim / "deploy").mkdir(parents=True, exist_ok=True)
         shutil.copy2(self.code / "experiment/robotwin/eval_policy_client_lingbotvla.py", sim / "eval_policy_client_lingbotvla.py")
         for name in ("__init__.py", "websocket_client_policy.py", "msgpack_numpy.py", "recap_rollout_recorder.py",
-                     "recap_instructions.py", "recap_seed_preflight.py"):
+                     "recap_instructions.py", "recap_seed_preflight.py", "recap_locked_cohort.py", "recap_evaluator_context.py"):
             shutil.copy2(self.code / "deploy" / name, sim / "deploy" / name)
 
     def cohort(self, task, index, count, gpu):
@@ -261,8 +326,15 @@ class Study:
         registry = read_json(spec["registry_path"])
         if sha256(spec["registry_path"]) != spec["registry_sha256"]:
             raise ValueError("Job registry changed")
+        if sha256(folder / "cohorts.json") != spec["cohort_manifest_sha256"]:
+            raise ValueError("Job cohort manifest changed")
         result = {}
         for task in spec["tasks"]:
+            cohort = load_locked_cohort(
+                folder / "cohorts.json", task=task, task_config=self.plan["protocol"]["task_config"],
+                seeds=spec["seeds"][task], count=spec["count"],
+                instructions=[spec["instructions"][task][str(seed)] for seed in spec["seeds"][task]],
+            )
             attempts = [p for p in (folder / "rollouts").glob("attempt-*") if (p / task).is_dir()]
             if not attempts:
                 raise ValueError(f"No completed rollout directory: {folder}/{task}")
@@ -274,7 +346,9 @@ class Study:
                 if seed in rows or str(seed) not in spec["instructions"][task]:
                     raise ValueError("Duplicate/unplanned episode")
                 validate_runtime(row, task=task, seed=seed, instruction=spec["instructions"][task][str(seed)],
-                                 condition=spec["condition"], registry=registry, protocol=self.plan["protocol"])
+                                 condition=spec["condition"], registry=registry, protocol=self.plan["protocol"], cohort=cohort)
+                if recorded_initial_hashes(path, row) != cohort.entries[seed]["initial_observation_sha256"]:
+                    raise ValueError("Recorded initial arrays differ from the locked preflight")
                 rows[seed] = (path, row)
             if set(rows) != set(spec["seeds"][task]):
                 raise ValueError(f"Incomplete planned cohort: {folder}/{task}: {len(rows)}/{spec['count']}")
@@ -286,6 +360,18 @@ class Study:
                     raise ValueError(f"Completed rollout evidence changed: {record['path']}")
         return result
 
+    def read_job_before_completion(self, folder):
+        try:
+            return self.read_job(folder)
+        except Exception as error:
+            # The launcher has returned: preserve failed attempts too, even
+            # though no complete-cohort done.json can be issued.
+            failure = folder / "failure.json"
+            if not failure.exists():
+                write_json(failure, {"error": repr(error), "created_at_unix": time.time()}, immutable=True)
+            self.persist([p for p in sorted(folder.rglob("*")) if p.is_file()])
+            raise
+
     def persist_job(self, folder):
         if not (folder / "persisted.json").exists():
             self.persist([p for p in sorted(folder.rglob("*")) if p.is_file()])
@@ -293,18 +379,28 @@ class Study:
             self.persist([folder / "persisted.json"])
 
     def evaluate(self, phase, index, variant, tasks, count, gpu, registry, condition):
+        if self.stop_requested.is_set():
+            raise concurrent.futures.CancelledError("Study stopped before evaluation")
         folder = self.root / "evaluations" / phase / f"s{index}" / variant / f"gpu{gpu}"
-        seeds, instructions = {}, {}
+        seeds, instructions, cohorts = {}, {}, {}
         for task in tasks:
             report = read_json(self.root / "cohorts" / f"s{index}" / task / "preflight.json")
             if report["episodes"] != count:
                 raise ValueError("Cohort size changed")
             seeds[task] = [row["seed"] for row in report["accepted"]]
             instructions[task] = {str(row["seed"]): row["instruction"] for row in report["accepted"]}
+            path = self.root / "cohorts" / f"s{index}" / task / "preflight.json"
+            expected = read_json(path.with_name("lock.json"))["sha256"]
+            if sha256(path) != expected:
+                raise ValueError("Frozen cohort changed before evaluation")
+            cohorts[task] = {"path": str(path), "sha256": expected}
+        write_json(folder / "cohorts.json", {"schema_version": 1, "task_config": self.plan["protocol"]["task_config"],
+                                            "tasks": cohorts}, immutable=True)
         spec = {"phase": phase, "seed_index": index, "variant": variant, "tasks": tasks, "count": count,
                 "gpu": gpu, "registry_path": str(registry), "registry_sha256": sha256(registry),
                 "condition": condition, "seeds": seeds, "instructions": instructions,
-                "code_sha256": self.plan["code_sha256"]}
+                "code_sha256": self.plan["code_sha256"],
+                "cohort_manifest_sha256": sha256(folder / "cohorts.json")}
         write_json(folder / "job.json", spec, immutable=True)
         write_json(folder / "seeds.json", {"schema_version": 1, "tasks": seeds}, immutable=True)
         write_json(folder / "instructions.json", {"schema_version": 1, "tasks": instructions}, immutable=True)
@@ -315,7 +411,7 @@ class Study:
         if (folder / "launch.json").exists():
             # A terminated supervisor may leave completed authoritative manifests.
             # Do not silently run a different trial under the same statistical ID.
-            rows = self.read_job(folder)
+            rows = self.read_job_before_completion(folder)
             rc = "recovered_from_complete_local_manifests"
         else:
             write_json(folder / "launch.json", {"started_at_unix": time.time()}, immutable=True)
@@ -327,13 +423,14 @@ class Study:
                        "--seed", str(index), "--policy_seed", "900", "--continuation_policy_seed", "300",
                        "--counterfactual_policy_decision", "0", "--common_noise_per_episode",
                        "--recap_environment_seed_map", str(folder / "seeds.json"), "--recap_setup_retries", "5",
+                       "--recap_cohort_manifest", str(folder / "cohorts.json"),
                        "--recap_instruction_map", str(folder / "instructions.json"), "--recap_adapter_registry", str(registry),
                        "--recap_condition", condition, "--num_gpus", "1", "--gpu_offset", str(gpu),
                        "--start_port", str(10100 + gpu), "--use_length", "50", "--no_video",
                        "--use_bf16", "False", "--use_fp32", "True", "--use_compile", "False",
                        "--deterministic_algorithms", "True", "--recap_rollout_dir", str(folder / "rollouts")]
             rc = self.execute(command, cwd=self.code, env=self.env, log=folder / "launcher.log")
-            rows = self.read_job(folder)  # Complete manifests, not NFS result JSON, are authoritative.
+            rows = self.read_job_before_completion(folder)  # Local manifests, not NFS result JSON, are authoritative.
         manifests = [{"task": task, "seed": seed, "path": str(path), "sha256": sha256(path)}
                      for task, values in rows.items() for seed, (path, _) in values.items()]
         files = []
@@ -500,9 +597,13 @@ def main():
     parser.add_argument("--stop-after", choices=["control", "screen", "confirm"])
     parser.add_argument("--project", type=Path, default=Path("/vla-cd/ReconVLA/Lingbot-VLA"))
     parser.add_argument("--source-repo", type=Path, default=Path("/dev/shm/lingbot-vla-v2-recap"))
+    parser.add_argument("--inherit-cohorts-from", type=Path,
+                        help="New amended snapshot only: preserve complete consumed-index 32/42 cohorts, not outcomes")
     args = parser.parse_args()
+    if args.inherit_cohorts_from is not None and not args.initialize:
+        parser.error("--inherit-cohorts-from requires --initialize of a NEW study")
     if args.initialize:
-        initialize(args.study, args.project, args.source_repo)
+        initialize(args.study, args.project, args.source_repo, args.inherit_cohorts_from)
     frozen_script = args.study / "code/scripts/recap_confirmatory_study.py"
     if Path(__file__).resolve() != frozen_script.resolve():
         argv = [sys.executable, str(frozen_script), "--study", str(args.study)]

@@ -140,3 +140,20 @@ def test_strict_study_requires_actual_strict_runtime():
     runtime["deterministic_warn_only"] = True
     with pytest.raises(ValueError, match="runtime mismatch"):
         validate_runtime(row, **kwargs)
+
+
+def test_locked_execution_requires_actual_cohort_evidence():
+    from types import SimpleNamespace
+    row, kwargs = runtime_fixture()
+    kwargs["protocol"]["eligibility_protocol"] = "locked-expert-preflight-v1"
+    hashes = {"state": "a" * 64}
+    cohort = SimpleNamespace(sha256="f" * 64, entries={kwargs["seed"]: {"initial_observation_sha256": hashes}})
+    kwargs["cohort"] = cohort
+    with pytest.raises(ValueError, match="eligibility/runtime mismatch"):
+        validate_runtime(row, **kwargs)
+    row["metadata"].update(eligibility_protocol="locked-expert-preflight-v1", preflight_sha256=cohort.sha256,
+                           initial_observation_sha256=hashes, evaluator_context={}, expert_rollouts_before_policy=0)
+    validate_runtime(row, **kwargs)
+    row["metadata"]["expert_rollouts_before_policy"] = 1
+    with pytest.raises(ValueError, match="eligibility/runtime mismatch"):
+        validate_runtime(row, **kwargs)

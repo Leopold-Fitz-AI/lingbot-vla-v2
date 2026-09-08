@@ -68,11 +68,19 @@ def holm_adjust(p_values):
     return adjusted
 
 
-def validate_runtime(row, *, task, seed, instruction, condition, registry, protocol):
+def validate_runtime(row, *, task, seed, instruction, condition, registry, protocol, cohort=None):
     if row["task"] != instruction or row["seed"] != seed or row["metadata"]["task_name"] != task:
         raise ValueError("Task/seed/instruction mismatch")
     if not isinstance(row["success"], bool) or not row.get("steps"):
         raise ValueError("Invalid/empty rollout outcome")
+    if protocol.get("eligibility_protocol"):
+        metadata = row["metadata"]
+        if (cohort is None or metadata.get("eligibility_protocol") != protocol["eligibility_protocol"]
+                or metadata.get("preflight_sha256") != cohort.sha256
+                or metadata.get("expert_rollouts_before_policy") != 0
+                or metadata.get("evaluator_context") != cohort.entries[seed].get("evaluator_context", {})
+                or metadata.get("initial_observation_sha256") != cohort.entries[seed]["initial_observation_sha256"]):
+            raise ValueError("Locked cohort eligibility/runtime mismatch")
     entry = registry.get("tasks", {}).get(task)
     for index, step in enumerate(row["steps"]):
         runtime = (step.get("info") or {}).get("recap_runtime")
@@ -103,6 +111,19 @@ def validate_runtime(row, *, task, seed, instruction, condition, registry, proto
             raise ValueError("Invalid decision indices/action lengths")
     if bool(row["steps"][-1].get("terminated")) != row["success"]:
         raise ValueError("Terminal flag disagrees with outcome")
+
+
+def recorded_initial_hashes(path, row):
+    from deploy.recap_seed_preflight import initial_observation_hashes
+    with np.load(path.parent / row["steps"][0]["file"], allow_pickle=False) as data:
+        observation = {
+            "joint_action": {"vector": data["observation::observation.state"]},
+            "observation": {name: {"rgb": data["observation::observation.images." + key]}
+                            for name, key in (("head_camera", "cam_high"),
+                                              ("left_camera", "cam_left_wrist"),
+                                              ("right_camera", "cam_right_wrist"))},
+        }
+        return initial_observation_hashes(observation)
 
 
 def initial_drift(left, right):

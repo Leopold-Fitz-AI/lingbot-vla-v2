@@ -7,6 +7,7 @@ import time
 
 import numpy as np
 
+from deploy.recap_evaluator_context import capture_evaluator_context
 from deploy.recap_instructions import INSTRUCTION_PROTOCOL, generate_task_instruction
 
 
@@ -49,6 +50,7 @@ def preflight_environment_seeds(
                     env.setup_demo(now_ep_num=len(accepted), seed=seed, is_test=True, **args)
                     info = env.play_once()
                     feasible = bool(env.plan_success and env.check_success())
+                    context = capture_evaluator_context(env, task) if feasible else None
                 finally:
                     env.close_env()
                 if not feasible:
@@ -63,7 +65,7 @@ def preflight_environment_seeds(
                 finally:
                     env.close_env()
                 accepted.append({"seed": seed, "instruction": text,
-                                 "initial_observation_sha256": hashes})
+                                 "initial_observation_sha256": hashes, "evaluator_context": context})
                 record["accepted"] = True
             except Exception as error:
                 record.update(accepted=False, error_type=type(error).__name__, error=str(error)[:1000])

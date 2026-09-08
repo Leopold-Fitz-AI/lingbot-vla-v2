@@ -42,6 +42,7 @@
 #   --recap_instruction_map per-task, per-environment-seed instruction JSON
 #   --recap_environment_seed_map exact per-task seed-list JSON for paired evaluation
 #   --recap_setup_retries retries per fixed seed before failing the task
+#   --recap_cohort_manifest verified expert-preflight locks for cohort execution
 #   --recap_deterministic_instructions choose task/seed-stable generated instructions
 #   --recap_rollout_dir optional directory for raw RECAP rollout bundles
 #   --keep_inference    keep inference servers resident after simulation
@@ -92,6 +93,7 @@ recap_condition_decisions=-1
 recap_instruction_map="${RECAP_TASK_INSTRUCTION_MAP:-}"
 recap_environment_seed_map="${RECAP_ENVIRONMENT_SEED_MAP:-}"
 recap_setup_retries=3
+recap_cohort_manifest="${RECAP_COHORT_MANIFEST:-}"
 recap_deterministic_instructions=False
 recap_rollout_dir=""
 robo_name="robotwin"
@@ -136,6 +138,7 @@ while [[ $# -gt 0 ]]; do
         --recap_instruction_map) recap_instruction_map="$2"; shift 2 ;;
         --recap_environment_seed_map) recap_environment_seed_map="$2"; shift 2 ;;
         --recap_setup_retries) recap_setup_retries="$2"; shift 2 ;;
+        --recap_cohort_manifest) recap_cohort_manifest="$2"; shift 2 ;;
         --recap_deterministic_instructions) recap_deterministic_instructions=True; shift ;;
         --recap_rollout_dir) recap_rollout_dir="$2"; shift 2 ;;
         --robo_name)         robo_name="$2";         shift 2 ;;
@@ -182,6 +185,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --recap_instruction_map per-task, per-seed instruction JSON"
             echo "  --recap_environment_seed_map exact per-task seed-list JSON"
             echo "  --recap_setup_retries fixed-seed setup retries before failure (default: 3)"
+            echo "  --recap_cohort_manifest execute checksum-locked expert-preflight cohort"
             echo "  --recap_deterministic_instructions use task/seed-stable generated text"
             echo "  --recap_rollout_dir save raw rollout bundles to this directory"
             echo "  --robo_name         robot config name (default: robotwin)"
@@ -538,7 +542,7 @@ fi
 deploy_pkg_src="${inference_workdir}deploy"
 deploy_pkg_dst="${eval_workdir}/script/deploy"
 mkdir -p "$deploy_pkg_dst"
-for f in __init__.py websocket_client_policy.py msgpack_numpy.py recap_rollout_recorder.py recap_instructions.py recap_seed_preflight.py; do
+for f in __init__.py websocket_client_policy.py msgpack_numpy.py recap_rollout_recorder.py recap_instructions.py recap_seed_preflight.py recap_locked_cohort.py recap_evaluator_context.py; do
     if [ ! -f "$deploy_pkg_src/$f" ]; then
         echo -e "\033[31mError: deploy helper source not found: ${deploy_pkg_src}/${f}\033[0m"
         exit 1
@@ -647,11 +651,12 @@ launch_task() {
     RECAP_TASK_INSTRUCTION_MAP="${recap_instruction_map}" \
     RECAP_ENVIRONMENT_SEED_MAP="${recap_environment_seed_map}" \
     RECAP_SETUP_RETRIES="${recap_setup_retries}" \
+    RECAP_COHORT_MANIFEST="${recap_cohort_manifest}" \
     RECAP_COMMON_NOISE_PER_EPISODE="${common_noise_per_episode}" \
     RECAP_DETERMINISTIC_INSTRUCTIONS="${recap_deterministic_instructions}" \
     RECAP_CONDITION_START_DECISION="${recap_condition_start_decision}" \
     RECAP_CONDITION_DECISIONS="${recap_condition_decisions}" \
-    setsid bash -c "source ${conda_sh} && conda activate ${sim_env} && export PYTHONPATH=\"\$(python -c 'import site;print(site.getsitepackages()[0])')\${PYTHONPATH:+:\$PYTHONPATH}\" && PYTHONUNBUFFERED=1 PYTHONWARNINGS=ignore::UserWarning XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 RECAP_POLICY_SEED='${slot_policy_seed}' RECAP_CONTINUATION_POLICY_SEED='${continuation_policy_seed}' RECAP_COUNTERFACTUAL_POLICY_DECISION='${counterfactual_policy_decision}' RECAP_COUNTERFACTUAL_POLICY_DECISION_MAP='${counterfactual_policy_decision_map}' RECAP_TASK_INSTRUCTION_MAP='${recap_instruction_map}' RECAP_ENVIRONMENT_SEED_MAP='${recap_environment_seed_map}' RECAP_SETUP_RETRIES='${recap_setup_retries}' RECAP_COMMON_NOISE_PER_EPISODE='${common_noise_per_episode}' RECAP_DETERMINISTIC_INSTRUCTIONS='${recap_deterministic_instructions}' RECAP_CONDITION_START_DECISION='${recap_condition_start_decision}' RECAP_CONDITION_DECISIONS='${recap_condition_decisions}' python -u ${eval_client_dst} --config policy/${policy_name}/deploy_policy.yml \
+    setsid bash -c "source ${conda_sh} && conda activate ${sim_env} && export PYTHONPATH=\"\$(python -c 'import site;print(site.getsitepackages()[0])')\${PYTHONPATH:+:\$PYTHONPATH}\" && PYTHONUNBUFFERED=1 PYTHONWARNINGS=ignore::UserWarning XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 RECAP_POLICY_SEED='${slot_policy_seed}' RECAP_CONTINUATION_POLICY_SEED='${continuation_policy_seed}' RECAP_COUNTERFACTUAL_POLICY_DECISION='${counterfactual_policy_decision}' RECAP_COUNTERFACTUAL_POLICY_DECISION_MAP='${counterfactual_policy_decision_map}' RECAP_TASK_INSTRUCTION_MAP='${recap_instruction_map}' RECAP_ENVIRONMENT_SEED_MAP='${recap_environment_seed_map}' RECAP_SETUP_RETRIES='${recap_setup_retries}' RECAP_COHORT_MANIFEST='${recap_cohort_manifest}' RECAP_COMMON_NOISE_PER_EPISODE='${common_noise_per_episode}' RECAP_DETERMINISTIC_INSTRUCTIONS='${recap_deterministic_instructions}' RECAP_CONDITION_START_DECISION='${recap_condition_start_decision}' RECAP_CONDITION_DECISIONS='${recap_condition_decisions}' python -u ${eval_client_dst} --config policy/${policy_name}/deploy_policy.yml \
         --overrides \
         --task_name ${task_name} \
         --task_config ${task_config} \
@@ -759,13 +764,15 @@ while [ $((completed + skipped)) -lt $total_tasks ] && has_running; do
                 fi
             else
                 task_retries[$task_name]=$((task_retries[$task_name] + 1))
-                if [ ${task_retries[$task_name]} -lt $max_retries ]; then
+                # Exit 78 is a frozen-cohort/state mismatch, not a transient
+                # setup failure. Never retry until matching data happen to appear.
+                if [ ${task_retries[$task_name]} -lt $max_retries ] && [ "$exit_code" -ne 78 ]; then
                     echo -e "\033[31m  [fail] ${task_name} slot $slot took ${task_duration}s exit=${exit_code}, retrying on this slot (${task_retries[$task_name]}/${max_retries})\033[0m"
                     # Retry immediately on the same slot
                     launch_task $slot "$task_name"
                 else
                     skipped=$((skipped + 1))
-                    echo -e "\033[31m  [skip] ${task_name} failed ${max_retries} times, no more retries\033[0m"
+                    echo -e "\033[31m  [skip] ${task_name} exit=${exit_code} after ${task_retries[$task_name]} attempts, no more retries\033[0m"
                     result_status+=("skip:${exit_code}")
                     result_task_names+=("$task_name")
                     result_durations+=("$task_duration")

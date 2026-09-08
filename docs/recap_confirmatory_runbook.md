@@ -2,10 +2,14 @@
 
 ## Studies on `ssh jy`
 
-- `W=/dev/shm/recap_confirmatory_20260908_deterministic`: current strict study.
-  Control passed (12/12 byte-identical paired trajectories); the full controller
-  resumed at 08:44 UTC, 2026-09-08, under tmux `recap-confirmatory-strict`.
-  Controller log: `/dev/shm/recap-strict-full-controller.log`.
+- `W=/dev/shm/recap_confirmatory_20260908_locked_cohorts`: current amended study.
+  Reuses ALL original control/screen cohorts, not their policy results. Initial
+  control launched at 14:45 UTC with `--stop-after control`, tmux
+  `recap-locked-control`, log `/dev/shm/recap-locked-controller.log`.
+- `/dev/shm/recap_confirmatory_20260908_deterministic`: stopped during screening
+  at **540/600 validated episodes** when `hanging_mug / positive_d1` exhausted
+  all three attempts at seed 4300019. No shortlist/confirmation/final access.
+  Preserve its frozen code, failed attempts and outcomes; do NOT resume it.
 - `/dev/shm/recap_confirmatory_20260908`: failed initial A/A startup; preserve it.
   Its validation/final cohorts were never opened. Do not overwrite its frozen code.
 - `/dev/shm/recap_null_replay_20260908`: fixed-observation diagnosis of custom
@@ -19,7 +23,7 @@ registry is changed automatically.
 ## Progress, without peeking at interim final success
 
 ```bash
-W=/dev/shm/recap_confirmatory_20260908_deterministic
+W=/dev/shm/recap_confirmatory_20260908_locked_cohorts
 /dev/shm/conda-lingbot-recap/bin/python \
   /dev/shm/lingbot-vla-v2-recap/scripts/recap_study_status.py "$W"
 ```
@@ -32,13 +36,15 @@ significance from an existing result directory or a GPU becoming idle.
 
 ## Safe continuation
 
-The initial strict invocation intentionally uses `--stop-after control` so the
-patched end-to-end launcher can be reviewed before validation is opened. Once
-that control passes and no controller still holds the lock, continue **the same
-private snapshot** without `--initialize` or `--stop-after`:
+The amended invocation intentionally uses `--stop-after control`. Require both
+`control.json` AND the passed `cross_protocol_control.json` (all twelve complete
+Null trajectories match the previous strict study). Once those gates pass and
+no controller still holds the lock, continue **the new private snapshot** without
+`--initialize` or `--stop-after`. This is NOT permission to retry the stopped
+predecessor or to regenerate its cohorts:
 
 ```bash
-W=/dev/shm/recap_confirmatory_20260908_deterministic
+W=/dev/shm/recap_confirmatory_20260908_locked_cohorts
 export CUDA_VISIBLE_DEVICES=4,5,6,7 PYTHONNOUSERSITE=1 PYTHONPATH="$W/code"
 /dev/shm/conda-lingbot-recap/bin/python -u \
   "$W/code/scripts/recap_confirmatory_study.py" --study "$W"
@@ -67,7 +73,7 @@ version, not bypassing `code_sha256` or rewriting an immutable decision file.
    paired analysis. The primary final budget is 6000 episodes, plus negative
    diagnostics only on registered tasks. There is no final-test-driven tuning.
 
-See `plan.json`, `power.json`, `startup_amendment.json` and the archived
+See `plan.json`, `power.json`, `cohort_inheritance.json` and the archived
 preregistration for the exact criteria and assumptions. A +20 pp change on one
 of fifty tasks contributes only +0.4 pp to the fixed-suite macro mean. Report
 all tasks and adapted-task contributions, not just the winning task.
@@ -91,8 +97,21 @@ verified `screen_null_hanging_retry_evidence.tar.gz` in the strict study.
 The underlying expert-planner variability has not been localized; any future
 failure exhausting the existing retry limit must still stop the study.
 
-As of 10:23 UTC, screening had 100/600 validated policy episodes (including its
-80-episode shared Null baseline); index 43–44 confirmation and the final set had
-not been opened. The controller remains autonomous under the frozen gates.
-Validation and final outcomes remain unproven until those gates actually finish.
-Launching the controller is not completing the requested statistical proof.
+The later Positive-d1 job exhausted its cap and the strict study STOPPED at
+540/600 validated episodes. A live controller while concurrent tasks drained
+was not evidence that screening could complete. No fourth attempt, seed
+substitution, changed adapter or dropped candidate is permitted.
+
+The [locked-eligibility repair](recap_cohort_recovery_20260908.md) removes repeat
+expert screening ONLY for checksum-verified preflight cohorts, restores any
+required evaluator-only context, and fails non-retryably on an initial-state
+hash mismatch. The new study reruns the full control and full 600-episode
+screen. Index 42 remains consumed selection data; indices 43–44 and 50–52 stay
+sealed until the original stage gates permit access.
+
+The new **24/24-episode control passed** (recorded at 15:00 UTC). Both
+independent arms produced byte-identical arrays in all twelve paired full
+trajectories. All twelve new Null trajectories also matched the previous strict
+control byte-for-byte, including outcomes. `control_trajectory_audit.json` and
+`cross_protocol_control.json` are read-back verified. The repair is therefore
+eligible for a complete screen rerun; no significant 50-task gain is yet proven.

@@ -9,11 +9,11 @@ from pathlib import Path
 def study_status(root):
     status = json.loads((root / "status.json").read_text())
     status["final_seeds_opened"] = (root / "final_opened.json").exists()
-    stages = {}
+    stages, failures = {}, []
     for job in sorted((root / "evaluations").glob("*/*/*/*/job.json")):
         spec = json.loads(job.read_text())
         phase = stages.setdefault(spec["phase"], {"planned_in_created_jobs": 0, "validated_episodes": 0,
-                                                  "completed_jobs": 0, "incomplete_jobs": 0})
+                                                  "completed_jobs": 0, "incomplete_jobs": 0, "failed_jobs": 0})
         phase["planned_in_created_jobs"] += len(spec["tasks"]) * spec["count"]
         done = job.parent / "done.json"
         if done.exists():
@@ -21,6 +21,14 @@ def study_status(root):
             phase["completed_jobs"] += 1
         else:
             phase["incomplete_jobs"] += 1
+            failure = job.parent / "failure.json"
+            if failure.exists():
+                phase["failed_jobs"] += 1
+                failures.append({"job": str(job.parent), **json.loads(failure.read_text())})
+    if failures:
+        status["job_failures"] = failures
+        if status["state"] == "running":
+            status["state"] = "failure_detected_waiting_for_workers"
     status["stages"] = stages
     status["note"] = "No interim outcome aggregation. Incomplete jobs may be running or require infrastructure recovery."
     result = root / "final_result.json"

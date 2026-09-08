@@ -605,3 +605,10 @@ decisions, audits actual server telemetry, and stages checksummed rollout eviden
 `scripts/recap_study_status.py STUDY_ROOT` reports progress without aggregating
 partial final outcomes. See the [runbook](recap_confirmatory_runbook.md) for paths
 and safe continuation commands.
+
+The strict study stopped at 540/600 screening episodes because legacy policy
+execution reopened already-frozen expert eligibility. The [cohort recovery](recap_cohort_recovery_20260908.md)
+uses verified preflight membership, literal instructions, exact initial hashes
+and preserved evaluator-only context, without rerunning the expert. Ordinary
+unverified evaluations retain expert checks. The amended study reuses all
+original cohorts, not their policy outcomes; no retry cap or seed is changed.

@@ -18,6 +18,43 @@ sizes and reserved validation/final indices are unchanged. This is an explicit
 numerical-protocol amendment, not a change chosen using validation/test outcomes.
 See [the reproducibility audit](recap_null_reproducibility_20260908.md).
 
+## Amendment before independent confirmation — locked eligibility
+
+The deterministic successor stopped during index-42 screening: 540/600 planned
+policy episodes validated, but `hanging_mug / positive_d1` exhausted three whole-
+task attempts at fixed seed 4300019 (six expert rechecks per attempt). Preserve
+that study. The client was reopening expert eligibility even after the entire
+expert-only cohort had been accepted and checksum-frozen. This is not a failed
+learned-policy outcome and does not justify removing the seed.
+
+The new `locked-expert-preflight-v1` execution mode accepts ONLY a checksum-
+verified preflight report and sibling lock, matching the entire ordered seed
+list and literal instruction map. Expert feasibility remains mandatory ONCE
+in outcome-blind preflight; policy execution no longer re-screens membership.
+Before any policy call, each initial observation must additionally match the
+original preflight hashes exactly. Mismatch exits non-retryably (code 78), never
+resampling until a match. Physical setup failures retain the existing bounded
+retry policy. Ordinary evaluations without verified cohort evidence retain
+their live expert checks. Record/audit actual expert-call count (zero), cohort
+SHA and initial hashes, including the recorded NPZ arrays. Preserve evaluator-
+only context recorded by preflight: native `arm_tag` for `open_laptop`,
+`place_object_scale` and `put_object_cabinet`, plus the latter's dtype-preserved
+`origin_z`. These fields are assigned by the original expert and read by the
+unchanged success predicates. Restore only this allowlist; do not rerun or
+rewrite a success predicate. Missing context is fatal.
+
+Create a NEW frozen study. Inherit ALL original index-32 and index-42 cohorts,
+including the problematic seeds, without substituting, filtering or regenerating
+them. Repeat the index-32 A/A control and verify complete trajectories against
+the previous deterministic control before continuing. Rerun the ENTIRE 600-
+episode screen: no previous policy outcomes are imported or selectively reused.
+Index 42 is already-consumed selection data, NOT new confirmation evidence.
+Candidates/weights/windows/priority, policy numerics, sample sizes, the original
+paired-state tolerances and statistical criteria remain unchanged. Indices
+43–44 and 50–52 remain unopened until the same shortlist/admission gates pass.
+This transparent infrastructure amendment changes neither the models nor the
+failure threshold to rescue a favorable score. See [the recovery audit](recap_cohort_recovery_20260908.md).
+
 ## Claim and scope
 
 Primary estimand: change in the **equal-weight mean success rate of the fixed
@@ -65,8 +102,11 @@ Construct each cohort **without running the learned policy**. Starting at
 100000*(seed_index+1), take the first N seeds passing expert feasibility and a
 second rollout-style setup. At most 20*N candidate seeds, at most 3 attempts
 per candidate. Record every rejection. Never use VLA success to select seeds.
-Evaluation gets an exact seed and instruction map, with at most 6 same-seed
-setup attempts and the launcher's bounded whole-task retries. No substituted
+Evaluation gets an exact seed/instruction map plus a verified cohort manifest;
+it executes the locked membership rather than rechecking expert feasibility.
+There are at most 6 same-seed physical-setup attempts and the launcher's bounded
+whole-task retries (maximum three). Frozen-input or initial-hash violations
+are fatal and never retried. No substituted
 seeds, dropped tasks, shortened cohorts, or success-dependent retries.
 
 Initial positive/null observations must match within state max-abs <= 0.001
