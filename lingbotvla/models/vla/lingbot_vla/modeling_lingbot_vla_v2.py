@@ -511,6 +511,13 @@ class FlowMatchingV2(FlowMatchingV1):
                 "recap_adapter_type must be 'embedding' or 'velocity_lora'"
             )
 
+        # A base checkpoint has no RECAP tensors to overwrite these parameters.
+        # In particular an empty task registry must never leave the down
+        # projection as torch.empty: 0 * NaN is NaN, not a null residual.
+        # Loading an existing trained adapter still overwrites this initialization.
+        if self.recap_adapter_enabled:
+            self.reset_recap_adapter()
+
         self.config.align_params = getattr(self.config, "align_params", None) or {}
         if self.config.align_params != {}:
             self.steps = 0

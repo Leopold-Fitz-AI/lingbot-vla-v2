@@ -2,7 +2,6 @@ import hashlib
 import json
 import sys
 import os
-import random
 import subprocess
 
 sys.path.append("./")
@@ -12,6 +11,7 @@ from envs import CONFIGS_PATH
 from envs.utils.create_actor import UnStableError
 
 import numpy as np
+from deploy.recap_instructions import INSTRUCTION_PROTOCOL, generate_task_instruction
 from pathlib import Path
 from collections import deque
 import traceback
@@ -67,17 +67,6 @@ def deterministic_instructions_enabled():
         "true",
         "yes",
     }
-
-
-def deterministic_task_instruction(task_name, seed, candidates):
-    candidates = list(candidates)
-    if not candidates:
-        raise ValueError(
-            f"No generated instruction candidates for task={task_name!r}, seed={seed}"
-        )
-    digest = hashlib.sha256(f"{task_name}:{seed}".encode()).digest()
-    index = int.from_bytes(digest[:8], "big") % len(candidates)
-    return str(candidates[index])
 
 
 def mapped_counterfactual_decision(task_name):
@@ -205,8 +194,6 @@ def main(usr_args):
     video_size = None
     video_fps = str(usr_args.get("video_fps", 10))
 
-    get_model = eval_function_decorator(policy_name, "get_model")
-
     with open(f"./task_config/{task_config}.yml", "r", encoding="utf-8") as f:
         args = yaml.load(f.read(), Loader=yaml.FullLoader)
 
@@ -302,6 +289,21 @@ def main(usr_args):
     if test_num <= 0:
         raise ValueError(f"test_num must be positive, got {test_num}")
     topk = 1
+
+    preflight_path = usr_args.get("recap_seed_preflight")
+    if preflight_path:
+        # No WebSocket connection or learned-policy outcome is involved in
+        # constructing the cohort. Keep the report distinct from _result.json.
+        from deploy.recap_seed_preflight import preflight_environment_seeds
+        report = preflight_environment_seeds(
+            TASK_ENV, args, task=task_name, start_seed=st_seed, count=test_num,
+            generator=generate_episode_descriptions, instruction_type=instruction_type,
+            max_candidates=int(usr_args.get("recap_preflight_max_candidates", test_num * 20)),
+            setup_retries=int(usr_args.get("recap_preflight_setup_retries", 2)),
+            progress=lambda record: print("PREFLIGHT " + json.dumps(record), flush=True),
+        )
+        verified_atomic_write_json(preflight_path, report)
+        return
 
     # model = get_model(usr_args)
     # from IPython import embed;embed()
@@ -476,25 +478,6 @@ def eval_policy(task_name,
             continue
         episode_info_list = [episode_info["info"]]
         deterministic_instructions = deterministic_instructions_enabled()
-        if deterministic_instructions:
-            random_state = random.getstate()
-            generation_seed = int.from_bytes(
-                hashlib.sha256(
-                    f"instruction-generation:{task_name}:{now_seed}".encode()
-                ).digest()[:8],
-                "big",
-            )
-            random.seed(generation_seed)
-            try:
-                results = generate_episode_descriptions(
-                    args["task_name"], episode_info_list, test_num
-                )
-            finally:
-                random.setstate(random_state)
-        else:
-            results = generate_episode_descriptions(
-                args["task_name"], episode_info_list, test_num
-            )
         instruction_override = os.environ.get("RECAP_TASK_INSTRUCTION", "").strip()
         instruction_map_path = os.environ.get(
             "RECAP_TASK_INSTRUCTION_MAP", ""
@@ -519,14 +502,14 @@ def eval_policy(task_name,
         instruction = (
             instruction_override
             or instruction_from_map
-            or (
-                deterministic_task_instruction(
-                    task_name,
-                    now_seed,
-                    results[0][instruction_type],
-                )
-                if deterministic_instructions
-                else np.random.choice(results[0][instruction_type])
+            or generate_task_instruction(
+                task_name,
+                now_seed,
+                episode_info_list,
+                instruction_type,
+                test_num,
+                deterministic=deterministic_instructions,
+                generator=generate_episode_descriptions,
             )
         )
         instruction_source = (
@@ -575,6 +558,9 @@ def eval_policy(task_name,
                     ),
                     "instruction_overridden": instruction_source != "random",
                     "instruction_source": instruction_source,
+                    "instruction_protocol": (
+                        INSTRUCTION_PROTOCOL if deterministic_instructions else instruction_source
+                    ),
                     "instruction_map": os.environ.get("RECAP_TASK_INSTRUCTION_MAP"),
                     "environment_seed_map": os.environ.get(
                         "RECAP_ENVIRONMENT_SEED_MAP"
@@ -696,7 +682,7 @@ def eval_policy(task_name,
                     env_step_after=int(TASK_ENV.take_action_cnt),
                     terminated=succ,
                     truncated=(not succ and TASK_ENV.take_action_cnt >= TASK_ENV.step_lim),
-                    info={"server_latency": latency},
+                    info={"server_latency": latency, "recap_runtime": ret.get("_recap_runtime")},
                 )
 
             print(f"infer time {latency}")

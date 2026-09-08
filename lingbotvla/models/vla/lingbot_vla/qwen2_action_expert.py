@@ -323,6 +323,11 @@ class Qwen2TokenMoeBlock(nn.Module):
                         ),
                     )
                 except Exception as exc:
+                    if torch.are_deterministic_algorithms_enabled():
+                        # The fallback also casts FP32 operands to BF16. A
+                        # failed strict kernel must not silently change the
+                        # numerical protocol of a paired policy evaluation.
+                        raise RuntimeError("Deterministic MoE failed; refusing a backend/precision fallback") from exc
                     logger.warning_once(f"robby_moe_forward failed, falling back to fused_moe_forward: {exc}")
                     final_hidden_states = self.experts(
                         module=self,
@@ -332,6 +337,9 @@ class Qwen2TokenMoeBlock(nn.Module):
                         hidden_states=hidden_flat,
                     )
             else:
+                if (hidden_flat.is_cuda and not self.training and not torch.is_grad_enabled()
+                        and torch.are_deterministic_algorithms_enabled()):
+                    raise RuntimeError("Strict deterministic inference requires the deterministic robby MoE kernel")
                 final_hidden_states = self.experts(
                     module=self,
                     num_experts=self.num_experts,

@@ -1,3 +1,4 @@
+import hashlib
 import os
 import sys
 import time
@@ -250,6 +251,7 @@ class LingbotVLAv2Server:
         counterfactual_policy_decision_map=None,
         recap_adapter_path=None,
         recap_adapter_registry=None,
+        deterministic_algorithms=False,
     ) -> None:
         assert not (use_bf16 and use_fp32), 'Bfloat16 or Float32!!!'
         self.adaptive_ensemble_alpha = adaptive_ensemble_alpha
@@ -336,6 +338,11 @@ class LingbotVLAv2Server:
         self.use_bf16 = use_bf16
         self.use_fp32 = use_fp32
         self.action_key: str= "action"
+        if deterministic_algorithms and os.environ.get("CUBLAS_WORKSPACE_CONFIG") not in (":4096:8", ":16:8"):
+            raise ValueError("Deterministic inference requires CUBLAS_WORKSPACE_CONFIG=:4096:8 before CUDA initialization")
+        # Set after model imports/initialization, which may alter PyTorch flags.
+        # The custom MoE kernel explicitly honors this flag as well.
+        torch.use_deterministic_algorithms(bool(deterministic_algorithms), warn_only=False)
 
     def load_model_weights(self, path_to_pi_model, strict=True):
         all_safetensors = glob(os.path.join(path_to_pi_model, "*.safetensors"))
@@ -363,7 +370,10 @@ class LingbotVLAv2Server:
                     raise ValueError(
                         f"Non-RECAP tensor {key!r} found in adapter artifact"
                     )
-                adapter_weights[key] = f.get_tensor(key)
+                tensor = f.get_tensor(key)
+                if not torch.isfinite(tensor).all():
+                    raise ValueError(f"Non-finite RECAP tensor {key!r} in {artifact_path}")
+                adapter_weights[key] = tensor
         expected = {
             key
             for key in self.vla.state_dict()
@@ -384,6 +394,7 @@ class LingbotVLAv2Server:
                 "Adapter signed_velocity_axis metadata does not match model config"
             )
         result = self.vla.load_state_dict(adapter_weights, strict=False)
+        self.active_recap_artifact_sha256 = hashlib.sha256(Path(artifact_path).read_bytes()).hexdigest()
         if result.unexpected_keys:
             raise ValueError(
                 f"Unexpected adapter tensor(s): {result.unexpected_keys}"
@@ -650,6 +661,8 @@ class LingbotVLAv2Server:
                     value = value.float().cpu().numpy()
                 else:
                     value = np.asarray(value, dtype=np.float32)
+                if not np.isfinite(value).all():
+                    raise FloatingPointError(f"Non-finite policy output for {action!r}; refusing to execute")
                 action_chunk[action].append(value)
 
         for action_key in action_chunk.keys():
@@ -764,6 +777,25 @@ class LingbotVLAv2Server:
             environment_seed=self.active_environment_seed,
             per_episode=self.common_noise_per_episode,
         )
+        self.last_recap_runtime = {
+            "schema_version": 1,
+            "task_name": self.active_task_name,
+            "environment_seed": self.active_environment_seed,
+            "decision_index": self.global_step,
+            "effective_condition": effective_condition,
+            "action_noise_seed": action_seed,
+            "adapter_sha256": (
+                getattr(self, "active_recap_artifact_sha256", None)
+                if self.active_recap_adapter else None
+            ),
+            "condition_start_decision": self.active_recap_condition_start_decision,
+            "condition_decisions": self.active_recap_condition_decisions,
+            "cfg_scale": self.recap_cfg_scale,
+            "use_compile": bool(self.use_compile),
+            "use_bf16": bool(self.use_bf16),
+            "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+            "deterministic_warn_only": torch.is_deterministic_algorithms_warn_only_enabled(),
+        }
         if action_seed is not None:
             # Conditions share random numbers for a task/environment/decision,
             # while per-episode mode avoids replaying one noise path everywhere.
@@ -854,9 +886,9 @@ class LingbotVLAv2Server:
             if normalized_action is not None:
                 normalized_action = normalized_action[0]
 
-        result = action
+        result = dict(action)
+        result["_recap_runtime"] = dict(self.last_recap_runtime)
         if return_normalized:
-            result = dict(result)
             result["_normalized_actions"] = normalized_action
 
         self.global_step += 1
@@ -990,7 +1022,13 @@ def main():
         help="Apply the requested condition for only the first N policy decisions; -1 means all.",
     )
 
+    parser.add_argument(
+        "--deterministic_algorithms", type=str2bool, default=False,
+        help="Use strict deterministic algorithms, including fixed-order custom MoE reduction",
+    )
     args = parser.parse_args()
+    if args.deterministic_algorithms:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     # Reset after argument parsing so separate runs can sample different action
     # trajectories from the same deterministic RoboTwin initial state.
     set_seed_everywhere(args.policy_seed)
@@ -1009,6 +1047,7 @@ def main():
         policy_seed=args.policy_seed,
         continuation_policy_seed=args.continuation_policy_seed,
         common_noise_per_episode=args.common_noise_per_episode,
+        deterministic_algorithms=args.deterministic_algorithms,
         counterfactual_policy_decision=args.counterfactual_policy_decision,
         counterfactual_policy_decision_map=args.counterfactual_policy_decision_map,
         recap_adapter_path=args.recap_adapter_path,

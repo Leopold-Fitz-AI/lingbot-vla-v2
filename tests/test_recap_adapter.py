@@ -74,6 +74,18 @@ class RecapAdapterTest(unittest.TestCase):
         self.assertTrue(torch.equal(residual[1], -residual[2]))
         self.assertTrue(torch.equal(residual[2], torch.tensor([[6.0]])))
 
+    def test_signed_axis_can_reverse_positive_direction_between_states(self):
+        # Signed gating is not a globally fixed action vector. The same weights
+        # can produce opposite useful residuals from different state features.
+        hidden = torch.tensor([[[1.0, 0.0]], [[-1.0, 0.0]]])
+        lora_a = torch.tensor([[[0.0, 0.0]], [[1.0, 0.0]]])
+        lora_b = torch.tensor([[[0.0]], [[2.0]]])
+        positive = apply_recap_velocity_lora(
+            hidden, [1, 1], lora_a, lora_b, signed_axis=True
+        )
+        assert torch.equal(positive[0], -positive[1])
+        assert positive[0].item() == 2.0
+
     def test_zero_up_projection_preserves_all_conditions_and_gets_gradient(self):
         hidden = torch.randn(2, 3, 4)
         lora_a = torch.randn(2, 2, 4, requires_grad=True)

@@ -438,8 +438,10 @@ mixed-outcome environment states (16 positive and 16 negative). The final
 signed model trained a rank-8 velocity LoRA only on the 16 causal-positive
 samples while all 1,708 official tensors were kept elementwise unchanged.
 Evaluation used FP32, policy seed 42, random task
-instructions, and three fresh environment-seed groups not used for collection
-or model selection:
+instructions, compiled inference (the historical launcher's default), and a
+process-global policy RNG stream. It did **not** use the later per-episode
+common-noise protocol. Three fresh environment-seed groups were not used for
+collection or model selection:
 
 | Condition | Seed group 24 | Seed group 25 | Seed group 26 | Aggregate |
 | --- | ---: | ---: | ---: | ---: |
@@ -455,6 +457,59 @@ ties (p=0.00341796875). Seed group 26 loaded the compact artifact over the
 untouched official base checkpoint. This resolves the diagnosed `click_bell`
 instability, but it is not evidence for a 50-task improvement until the same
 protocol is repeated across tasks and larger held-out sets.
+
+## Replay regression audit (2026-09-08)
+
+Do not equate an environment seed with a causal intervention state. The V2
+holdout controller changed continuation seed 200 to 300 and intervention index
+1 to the default 0. The old deterministic instruction generator also used
+`test_num` as its candidate-list length: collecting 30 episodes and evaluating
+3–5 changed the text for the same task/seed. In the initial three-task audit,
+10/13 instructions changed and 0/13 intervention observations matched the
+collected states within their declared tolerances. These rollouts remain
+cross-protocol policy-generalization measurements, **not** fixed-state causal
+replays and not evidence that action/outcome signal is absent.
+
+Deterministic text now uses a fixed 32-description budget, isolates Python and
+NumPy RNGs, and records `instruction_protocol=task-seed-v2-fixed-candidates32`.
+This is a protocol version change. To replay an existing dataset, freeze its
+**literal collected text**, rather than regenerate it with either implementation:
+
+```bash
+python scripts/recap_audit_causal_replay.py \
+  --input /path/to/state_splits/click_bell/holdout \
+  --policy-seed 900 --output /dev/shm/click_replay_protocol
+```
+
+The generated directory contains environment, instruction, and decision maps,
+plus the collected continuation seed in `protocol.json`. Pass those maps with
+`--recap_environment_seed_map`, `--recap_instruction_map`, and
+`--counterfactual_policy_decision_map`, and preserve the continuation seed and
+`--common_noise_per_episode`. Set `--test_num` to the task's exact seed count;
+run tasks with different counts/schedules separately. Audit a null rollout by
+adding `--null-rollouts /path/to/null` to the command (use a new output directory).
+A mismatch exits nonzero; do not bypass the check by increasing tolerances.
+
+Always include the previously successful artifact as a positive control before
+changing the architecture or training objective. A 20-state diagnostic crossover
+on historical group 26, with eager FP32 and modern common noise, obtained
+null 16/20, v22-all 19/20, v22-decision-1 18/20, and V2-positive-only-all 18/20
+without retraining. The subsequent same-seed window/sign ablation obtained V2
+decision-1 16/20, V2 signed-negative-all 14/20, and v22 signed-negative-all 11/20.
+Thus V2-all gave 90% > null 80% > signed-negative 70%, while restricting V2 to
+decision 1 tied null. Correctly replaying the three original causal holdouts
+restored observation matching (3/3) and gave V2-positive 2/3 vs null 1/3.
+These small exploratory comparisons do not establish fresh statistical
+significance or authorize promotion. Compare arbitrary variants with
+`scripts/recap_compare_policy_variants.py`; it requires identical planned seeds,
+text, and noise metadata and reports underpowered comparisons as inconclusive.
+
+The signed adapter is `sign * B A h(state, noisy_action, time)`, **not** a fixed
+global action vector. Opposite raw action differences across states do not by
+themselves prove it cannot learn. Likewise a raw-action linear permutation probe
+is a useful diagnostic, not a necessary condition for a state-conditioned model.
+See [the investigation report](recap_root_cause_20260908.md) for evidence and
+remaining limitations. Keep new/final seed groups untouched during diagnosis.
 
 ## Scaling safely to the 50-task suite
 
@@ -527,3 +582,26 @@ instead of silently substituting different seeds.
 The go/no-go criterion is `positive > null > negative` on fresh held-out seeds,
 with null exactly preserving the base policy and no material regression on easy
 guard tasks.
+
+## Deterministic confirmatory evaluation
+
+Common action-noise seeds alone do not make the custom inference MoE repeatable.
+Use `--deterministic_algorithms True` on the policy server or RoboTwin launcher
+for strict paired evaluation. The flag enables stable route packing and
+fixed-order expert-output reduction; it defaults to False for legacy numerical
+compatibility. The CLI supplies `CUBLAS_WORKSPACE_CONFIG=:4096:8` if unset.
+Base-only adapter wrappers now initialize absent adapter tensors safely, and
+nonfinite adapters/actions are rejected rather than counted as policy failures.
+See the [Null reproducibility audit](recap_null_reproducibility_20260908.md).
+
+The [50-task preregistration](recap_confirmatory_protocol.md) separates consumed-
+seed controls, index-42 candidate selection, independent index-43–44 confirmation,
+and a single frozen-registry final evaluation on indices 50–52. The claim is
+an equal-weight mean improvement on the fixed suite, not improvement on every
+task. An incomplete or nonsignificant study is not a successful demonstration.
+
+`scripts/recap_confirmatory_study.py` snapshots code/weights, freezes cohorts and
+decisions, audits actual server telemetry, and stages checksummed rollout evidence.
+`scripts/recap_study_status.py STUDY_ROOT` reports progress without aggregating
+partial final outcomes. See the [runbook](recap_confirmatory_runbook.md) for paths
+and safe continuation commands.

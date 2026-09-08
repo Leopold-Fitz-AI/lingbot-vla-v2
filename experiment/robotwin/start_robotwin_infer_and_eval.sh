@@ -27,6 +27,7 @@
 #   --use_bf16          use bfloat16 inference (default: True)
 #   --use_fp32          use float32 inference (default: False)
 #   --use_compile       enable model compile in policy inference (default: True)
+#   --deterministic_algorithms strict PyTorch/custom-MoE repeatability (default: False)
 #   --recap_condition   RECAP branch requested from the policy (default: positive)
 #   --recap_adapter_path compact adapter safetensors overlaid on model_path
 #   --recap_adapter_registry task-to-adapter JSON; missing tasks use null/base
@@ -76,6 +77,7 @@ use_length=50
 use_bf16=True
 use_fp32=False
 use_compile=True
+deterministic_algorithms=False
 recap_condition="positive"
 recap_adapter_path=""
 recap_adapter_registry=""
@@ -119,6 +121,7 @@ while [[ $# -gt 0 ]]; do
         --use_bf16)          use_bf16="$2";        shift 2 ;;
         --use_fp32)          use_fp32="$2";        shift 2 ;;
         --use_compile)       use_compile="$2";     shift 2 ;;
+        --deterministic_algorithms) deterministic_algorithms="$2"; shift 2 ;;
         --recap_condition)   recap_condition="$2"; shift 2 ;;
         --recap_adapter_path) recap_adapter_path="$2"; shift 2 ;;
         --recap_adapter_registry) recap_adapter_registry="$2"; shift 2 ;;
@@ -420,6 +423,16 @@ declare -a result_status=()
 # ============================================================
 # Phase 1: start inference-side QwenPi servers (resident)
 # ============================================================
+policy_seed_for_slot() {
+    # Use this for BOTH the server and rollout metadata. In CRN mode the seed
+    # must not depend on the queue/GPU slot that happened to run a task.
+    if [ "$common_noise_per_episode" = true ]; then
+        printf '%s\n' "$policy_seed"
+    else
+        printf '%s\n' "$(( policy_seed + $1 ))"
+    fi
+}
+
 echo -e "\033[32m========== Starting inference side: ${num_slots} QwenPi servers, ports ${start_port}~$((start_port + num_slots - 1)) ==========\033[0m"
 
 cd "$inference_workdir" || { echo -e "\033[31mError: inference workdir ${inference_workdir} missing\033[0m"; exit 1; }
@@ -427,11 +440,7 @@ cd "$inference_workdir" || { echo -e "\033[31mError: inference workdir ${inferen
 for slot in $(seq 0 $((num_slots-1))); do
     gpu_id=$(( gpu_offset + slot % num_gpus ))
     port=$(( start_port + slot ))
-    if [ "$common_noise_per_episode" = true ]; then
-        slot_policy_seed=$policy_seed
-    else
-        slot_policy_seed=$(( policy_seed + slot ))
-    fi
+    slot_policy_seed=$(policy_seed_for_slot "$slot")
 
     export CUDA_VISIBLE_DEVICES=${gpu_id}
 
@@ -469,6 +478,7 @@ for slot in $(seq 0 $((num_slots-1))); do
         --use_bf16 "${use_bf16}" \
         --use_fp32 "${use_fp32}" \
         --use_compile "${use_compile}" \
+        --deterministic_algorithms '${deterministic_algorithms}' \
         --policy_seed '${slot_policy_seed}' \
         ${continuation_seed_arg} \
         ${common_noise_arg} \
@@ -528,7 +538,7 @@ fi
 deploy_pkg_src="${inference_workdir}deploy"
 deploy_pkg_dst="${eval_workdir}/script/deploy"
 mkdir -p "$deploy_pkg_dst"
-for f in __init__.py websocket_client_policy.py msgpack_numpy.py recap_rollout_recorder.py; do
+for f in __init__.py websocket_client_policy.py msgpack_numpy.py recap_rollout_recorder.py recap_instructions.py recap_seed_preflight.py; do
     if [ ! -f "$deploy_pkg_src/$f" ]; then
         echo -e "\033[31mError: deploy helper source not found: ${deploy_pkg_src}/${f}\033[0m"
         exit 1
@@ -598,7 +608,8 @@ launch_task() {
     local task_name=$2
     local gpu_id=$(( gpu_offset + slot % num_gpus ))
     local port=$(( start_port + slot ))
-    local slot_policy_seed=$(( policy_seed + slot ))
+    local slot_policy_seed
+    slot_policy_seed=$(policy_seed_for_slot "$slot")
 
     export CUDA_VISIBLE_DEVICES=${gpu_id}
 

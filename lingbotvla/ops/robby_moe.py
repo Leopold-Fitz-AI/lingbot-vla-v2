@@ -32,11 +32,26 @@ def _moe_pack_selected_kernel(
     slots = tl.arange(0, BLOCK_K)
     mask = slots < TOPK
     experts = tl.load(selected_ptr + row * TOPK + slots, mask=mask, other=0).to(tl.int32)
-    routes = tl.load(route_ptr + row * TOPK + slots, mask=mask, other=0.0).to(tl.float32)
     pos = tl.atomic_add(counts_ptr + experts, 1, sem="relaxed", mask=mask)
     store_mask = mask & (pos < MAX_ROUTES)
     tl.store(rows_ptr + experts * MAX_ROUTES + pos, row, mask=store_mask)
     tl.store(slots_ptr + experts * MAX_ROUTES + pos, slots, mask=store_mask)
+
+
+@triton.jit
+def _moe_pack_deterministic_kernel(
+    selected_ptr, counts_ptr, rows_ptr, slots_ptr,
+    TOPK: tl.constexpr, MAX_ROUTES: tl.constexpr, BLOCK: tl.constexpr,
+):
+    # Stable token/slot order inside each expert; no scheduling-dependent pack.
+    expert = tl.program_id(0)
+    route = tl.arange(0, BLOCK)
+    selected = tl.load(selected_ptr + route, mask=route < MAX_ROUTES, other=-1)
+    match = (route < MAX_ROUTES) & (selected == expert)
+    rank = tl.cumsum(match.to(tl.int32), axis=0) - 1
+    tl.store(counts_ptr + expert, tl.sum(match.to(tl.int32), axis=0))
+    tl.store(rows_ptr + expert * MAX_ROUTES + rank, route // TOPK, mask=match)
+    tl.store(slots_ptr + expert * MAX_ROUTES + rank, route % TOPK, mask=match)
 
 
 @triton.jit
@@ -120,6 +135,7 @@ def _moe_down_grouped_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_I: tl.constexpr,
+    STORE_ROUTES: tl.constexpr,
 ):
     expert = tl.program_id(0)
     bid_m = tl.program_id(1)
@@ -148,12 +164,35 @@ def _moe_down_grouped_kernel(
             other=0.0,
         )
         acc += tl.dot(x, w)
-    tl.atomic_add(
-        out_ptr + rows[:, None] * D + offs_d[None, :],
-        acc,
-        sem="relaxed",
-        mask=valid_m[:, None] & (offs_d[None, :] < D),
-    )
+    if STORE_ROUTES:
+        # Each route owns its output. Floating-point atomic_add across experts
+        # violates repeatability even under torch.use_deterministic_algorithms.
+        tl.store(
+            out_ptr + (rows[:, None] * TOPK + slots[:, None]) * D + offs_d[None, :],
+            acc,
+            mask=valid_m[:, None] & (offs_d[None, :] < D),
+        )
+    else:
+        tl.atomic_add(
+            out_ptr + rows[:, None] * D + offs_d[None, :],
+            acc,
+            sem="relaxed",
+            mask=valid_m[:, None] & (offs_d[None, :] < D),
+        )
+
+
+@triton.jit
+def _moe_reduce_routes_kernel(
+    routes_ptr, out_ptr, T: tl.constexpr, D: tl.constexpr,
+    TOPK: tl.constexpr, BLOCK: tl.constexpr,
+):
+    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    row, dim = offset // D, offset % D
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    # Fixed routing-rank order, independent of expert-kernel scheduling.
+    for slot in range(TOPK):
+        acc += tl.load(routes_ptr + (row * TOPK + slot) * D + dim, mask=row < T, other=0.0)
+    tl.store(out_ptr + offset, acc, mask=row < T)
 
 
 def robby_moe_forward(
@@ -165,7 +204,12 @@ def robby_moe_forward(
     down_weight: torch.Tensor,
     workspace: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """Inference-only grouped MoE path migrated from robbyvla_infer _moe."""
+    """Inference-only grouped MoE, respecting PyTorch's deterministic flag.
+
+    The legacy fast path sums routes with floating-point atomics. Strict mode
+    packs routes stably and reduces per-route outputs in a fixed top-k order.
+    The weights, routing rule, intermediate dtype and expert GEMMs are unchanged.
+    """
     if hidden_states.ndim != 2:
         raise ValueError(f"hidden_states must be 2D, got {tuple(hidden_states.shape)}")
     if selected_experts.ndim != 2 or routing_weights.ndim != 2:
@@ -184,6 +228,7 @@ def robby_moe_forward(
         )
 
     max_routes = T * top_k
+    deterministic = torch.are_deterministic_algorithms_enabled()
     if workspace is None:
         counts = torch.empty((E,), device=hidden_states.device, dtype=torch.int32)
         rows = torch.empty((E, max_routes), device=hidden_states.device, dtype=torch.int32)
@@ -197,22 +242,37 @@ def robby_moe_forward(
         inter = workspace["inter"]
         out = workspace["out"]
 
+    route_out = None
+    if deterministic:
+        if workspace is not None:
+            route_out = workspace.get("route_out")
+        if route_out is None:
+            route_out = torch.empty((T, top_k, D), device=hidden_states.device, dtype=torch.float32)
+            if workspace is not None:
+                workspace["route_out"] = route_out
+
     selected_i32 = selected_experts.to(torch.int32).contiguous()
     route = routing_weights.contiguous()
 
-    _zero_i32_kernel[(1,)](counts, E, BLOCK=triton.next_power_of_2(E), num_warps=1)
-    _moe_pack_selected_kernel[(T,)](
-        selected_i32,
-        route,
-        counts,
-        rows,
-        slots,
-        T,
-        top_k,
-        max_routes,
-        BLOCK_K=triton.next_power_of_2(top_k),
-        num_warps=1,
-    )
+    if deterministic:
+        _moe_pack_deterministic_kernel[(E,)](
+            selected_i32, counts, rows, slots, top_k, max_routes,
+            BLOCK=triton.next_power_of_2(max_routes), num_warps=4,
+        )
+    else:
+        _zero_i32_kernel[(1,)](counts, E, BLOCK=triton.next_power_of_2(E), num_warps=1)
+        _moe_pack_selected_kernel[(T,)](
+            selected_i32,
+            route,
+            counts,
+            rows,
+            slots,
+            T,
+            top_k,
+            max_routes,
+            BLOCK_K=triton.next_power_of_2(top_k),
+            num_warps=1,
+        )
     _moe_gate_up_grouped_kernel[
         (E, triton.cdiv(max_routes, 16), triton.cdiv(I, 32))
     ](
@@ -235,12 +295,13 @@ def robby_moe_forward(
         BLOCK_D=64,
         num_warps=4,
     )
-    _zero_fp32_kernel[(triton.cdiv(out.numel(), 1024),)](
-        out,
-        out.numel(),
-        BLOCK=1024,
-        num_warps=4,
-    )
+    if not deterministic:
+        _zero_fp32_kernel[(triton.cdiv(out.numel(), 1024),)](
+            out,
+            out.numel(),
+            BLOCK=1024,
+            num_warps=4,
+        )
     _moe_down_grouped_kernel[
         (E, triton.cdiv(max_routes, 16), triton.cdiv(D, 64))
     ](
@@ -249,7 +310,7 @@ def robby_moe_forward(
         counts,
         rows,
         slots,
-        out,
+        route_out if deterministic else out,
         T,
         D,
         E,
@@ -259,6 +320,11 @@ def robby_moe_forward(
         BLOCK_M=16,
         BLOCK_D=64,
         BLOCK_I=64,
+        STORE_ROUTES=deterministic,
         num_warps=4,
     )
+    if deterministic:
+        _moe_reduce_routes_kernel[(triton.cdiv(T * D, 1024),)](
+            route_out, out, T, D, top_k, BLOCK=1024, num_warps=4,
+        )
     return out.reshape_as(hidden_states)
