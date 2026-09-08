@@ -77,5 +77,22 @@ verification, but shared NFS has a history of later zero-filled files: verify
 checksums before using a mirror. `frozen_inputs.tar.gz` preserves the precise
 source, wrapper YAML and compact artifacts used by the study.
 
+## Screening infrastructure event (2026-09-08)
+
+The index-42 `hanging_mug` Null job required all three predeclared whole-task
+attempts. Attempts 1/2 completed 17/15 episodes, then failed expert revalidation
+of fixed seeds 4300022/4300019 after six setup attempts. Attempt 3 completed all
+20 frozen states. No seed was substituted, no fourth attempt was added, and
+no candidate/outcome criterion chose the retry. Every one of the 32 repeated
+completed episodes had byte-identical arrays and the same outcome in attempt 3.
+The two extra incomplete attempts are infrastructure overhead, not additional
+independent samples. See `expert_retry_resolution.json` and the read-back-
+verified `screen_null_hanging_retry_evidence.tar.gz` in the strict study.
+The underlying expert-planner variability has not been localized; any future
+failure exhausting the existing retry limit must still stop the study.
+
+As of 10:23 UTC, screening had 100/600 validated policy episodes (including its
+80-episode shared Null baseline); index 43–44 confirmation and the final set had
+not been opened. The controller remains autonomous under the frozen gates.
 Validation and final outcomes remain unproven until those gates actually finish.
 Launching the controller is not completing the requested statistical proof.
