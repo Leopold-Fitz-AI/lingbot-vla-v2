@@ -6,6 +6,10 @@
   Reuses ALL original control/screen cohorts, not their policy results. Initial
   control launched at 14:45 UTC with `--stop-after control`, tmux
   `recap-locked-control`, log `/dev/shm/recap-locked-controller.log`.
+  After both control audits passed, the full frozen controller resumed at
+  **15:13 UTC**, tmux `recap-confirmatory-locked`, PID 2101880, log
+  `/dev/shm/recap-locked-full-controller.log`. At 15:15 it was running the four
+  shared-Null screening jobs (0/600 validated yet); confirmation/final stayed sealed.
 - `/dev/shm/recap_confirmatory_20260908_deterministic`: stopped during screening
   at **540/600 validated episodes** when `hanging_mug / positive_d1` exhausted
   all three attempts at seed 4300019. No shortlist/confirmation/final access.
@@ -113,5 +117,8 @@ The new **24/24-episode control passed** (recorded at 15:00 UTC). Both
 independent arms produced byte-identical arrays in all twelve paired full
 trajectories. All twelve new Null trajectories also matched the previous strict
 control byte-for-byte, including outcomes. `control_trajectory_audit.json` and
-`cross_protocol_control.json` are read-back verified. The repair is therefore
+`cross_protocol_control.json` are read-back verified. `control_audit_roles.json`
+clarifies the generic purpose text in the same-study trajectory report; roots,
+manifest hashes and `paired_arms_same_study` identify the actual comparison.
+The repair is therefore
 eligible for a complete screen rerun; no significant 50-task gain is yet proven.
