@@ -1,5 +1,15 @@
 # Confirmatory study runbook
 
+## Latest milestone — 2026-09-09 03:10 UTC
+
+Screening (600) and independent confirmation (1200) have completed. Only
+`click_bell/v22_all` passed admission; the study-only registry is frozen.
+Final access is now OPEN, all fifty index-50 cohorts are frozen, and final
+policy execution has started. No final success aggregate has been inspected.
+The remaining budget is the complete 6000-primary + 60-Negative final design.
+See [completion tracking and terminal-only reporting](recap_confirmatory_completion_20260909.md).
+The older timestamps below are historical, not the current stage.
+
 ## Studies on `ssh jy`
 
 - `W=/dev/shm/recap_confirmatory_20260908_locked_cohorts`: current amended study.
