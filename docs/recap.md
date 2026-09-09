@@ -54,6 +54,17 @@ learns only a useful positive residual and can derive negative as its exact
 inverse (`recap_signed_velocity_axis: true`). Null is always the exact frozen
 base policy. The resulting policy axis is structurally
 `base - residual`, `base`, `base + residual` for negative, null, and positive.
+This is a velocity identity at the SAME hidden state, not a guarantee of
+success ordering or exact opposite final actions after flow integration.
+
+The later V2 `signed`/`regularized` experiments also fitted negative-labeled
+samples despite the positive-only recommendation. Their learner receives only
+`recap_label`, not pair identity or a calibrated advantage; `regularized` means
+signed BC plus residual L2. Do not call this a tested pairwise preference objective.
+The [three-task training audit](recap_three_task_training_diagnosis_20260909.md)
+quantifies the sparse single-decision data, train/eval MoE precision mismatch,
+and nearly rank-two initialization; the [repair plan](recap_three_task_repair_plan.md)
+specifies controlled follow-up experiments without modifying the current final study.
 
 ## Label schema
 
