@@ -121,6 +121,26 @@ def export_adapter(
             for name in adapter_names
         }
 
+    for name, tensor in tensors.items():
+        if not torch.isfinite(tensor).all():
+            raise ValueError(f"Non-finite adapter tensor: {name}")
+    training_configuration = None
+    config_path = checkpoint / "config.json"
+    if config_path.is_file():
+        config = json.loads(config_path.read_text())
+        if "recap_training_backend" in config or "recap_adapter_initialization" in config:
+            training_configuration = {
+                "config_sha256": _sha256(config_path),
+                "configured_initialization": config.get("recap_adapter_initialization", "legacy_sin_v1"),
+                "initialization_seed": config.get("recap_adapter_init_seed", 0),
+                "initialization_scale": config.get("recap_adapter_init_std", 0.02),
+                "training_backend": config.get("recap_training_backend", "legacy"),
+                "tensor_dtypes": sorted({str(t.dtype) for t in tensors.values()}),
+                # Config provenance is not proof that a GPU parity gate passed,
+                # or that loaded/resumed weights were reset using this scheme.
+                "scope": "checkpoint configuration, not a runtime parity attestation",
+            }
+
     output.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_name = tempfile.mkstemp(
         prefix=f".{output.name}.", suffix=".tmp", dir=output.parent
@@ -135,6 +155,8 @@ def export_adapter(
                 "format": "pt",
                 "schema": "lingbotvla-recap-adapter-v1",
                 "signed_velocity_axis": str(bool(signed_velocity_axis)).lower(),
+                **({"recap_training_configuration": json.dumps(training_configuration, sort_keys=True)}
+                   if training_configuration is not None else {}),
             },
         )
         with temporary.open("rb") as handle:
@@ -163,6 +185,7 @@ def export_adapter(
             for name, tensor in tensors.items()
         },
         "verification": verification,
+        "training_configuration": training_configuration,
     }
     metadata_path = output.with_suffix(output.suffix + ".json")
     metadata_bytes = (

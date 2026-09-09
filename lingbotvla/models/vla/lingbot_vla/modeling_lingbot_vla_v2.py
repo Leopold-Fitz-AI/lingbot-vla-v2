@@ -42,6 +42,13 @@ from lingbotvla.recap.cfg import (
     duplicate_cfg_denoise_inputs,
 )
 from lingbotvla.recap.loss import masked_action_loss
+from lingbotvla.recap.initialization import initialize_velocity_lora_
+from lingbotvla.recap.training import (
+    DEPLOYMENT_FEATURE_PROTOCOL,
+    TRAINING_BACKENDS,
+    frozen_deployment_mode,
+    validate_feature_outputs,
+)
 from lingbotvla.ops.triton_moe_loss import triton_sequence_wise_balance_loss
 from lingbotvla.models.vla.lingbot_vla.qwen2_action_expert import (
     Qwen2ForCausalLM,
@@ -561,21 +568,13 @@ class FlowMatchingV2(FlowMatchingV1):
         if self.recap_adapter_type == "embedding":
             self.recap_condition_embeddings.zero_()
             return
-        # Deterministic non-zero down projections and zero up projections are
-        # the standard LoRA initialization: behavior starts exactly at base,
-        # while the up projection receives gradient on the first step.
-        values = torch.arange(
-            self.recap_velocity_lora_a.numel(),
-            device=self.recap_velocity_lora_a.device,
-            dtype=torch.float32,
-        ).reshape_as(self.recap_velocity_lora_a)
-        init_std = float(getattr(self.config, "recap_adapter_init_std", 0.02))
-        self.recap_velocity_lora_a.copy_(
-            (torch.sin(values * 0.017) * init_std).to(
-                dtype=self.recap_velocity_lora_a.dtype
-            )
+        self._recap_initialization = initialize_velocity_lora_(
+            self.recap_velocity_lora_a,
+            self.recap_velocity_lora_b,
+            scheme=getattr(self.config, "recap_adapter_initialization", "legacy_sin_v1"),
+            seed=getattr(self.config, "recap_adapter_init_seed", 0),
+            init_std=float(getattr(self.config, "recap_adapter_init_std", 0.02)),
         )
-        self.recap_velocity_lora_b.zero_()
 
     def _recap_adapter_embedding(self, recap_condition_id, batch_size, device, dtype):
         return build_recap_condition_embedding(
@@ -922,6 +921,33 @@ class FlowMatchingV2(FlowMatchingV1):
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
+        backend = getattr(self.config, "recap_training_backend", "legacy")
+        if backend not in TRAINING_BACKENDS:
+            raise ValueError(f"Unknown recap_training_backend: {backend}")
+        if backend == "deployment":
+            if any(value is not None for value in (depth_targets, future_depth_targets,
+                                                  future_video_targets, future_video_cls_targets,
+                                                  future_video_current_patch)):
+                raise ValueError("Deployment-feature training cannot silently drop auxiliary targets")
+            hidden, base_velocity = self.recap_frozen_features(
+                images, img_masks, lang_tokens, lang_masks, state, x_t, time,
+                image_grid_thw=image_grid_thw,
+            )
+            # This MUST be outside no_grad: only the frozen function is detached.
+            velocity = self._apply_recap_velocity_adapter(hidden, base_velocity, recap_condition_id)
+            if not torch.isfinite(u_t).all() or not torch.isfinite(velocity).all():
+                raise FloatingPointError("Nonfinite deployment-training target/velocity")
+            if loss_type == "fm":
+                losses = F.mse_loss(u_t, velocity, reduction="none")
+            elif loss_type == "L1_fm":
+                losses = F.l1_loss(u_t, velocity, reduction="none")
+            else:
+                raise ValueError("Deployment-feature training supports fm and L1_fm only")
+            if not torch.isfinite(losses).all():
+                raise FloatingPointError("Nonfinite deployment-training flow loss")
+            zero = losses.new_zeros(())
+            metrics = {"recap/deployment_features": losses.new_ones(())}
+            return losses, zero, zero, zero, None, zero, zero, metrics, None, None, None
 
         (
             prefix_embs,
@@ -1054,6 +1080,58 @@ class FlowMatchingV2(FlowMatchingV1):
             moe_metrics.update(align_metrics)
         return losses, loss_depth, loss_future_depth, loss_future_video, depth_preds, seq_wise_loss, router_z_loss, moe_metrics, future_depth_preds, future_video_preds, current_video_preds
 
+    def recap_frozen_features(
+        self, images, img_masks, lang_tokens, lang_masks, state, x_t, timestep,
+        image_grid_thw=None,
+    ):
+        """Deployment's two-pass prefix/cache path for teacher-forced adapter FM.
+
+        No learned parameters may influence these inputs. The returned ordinary
+        tensors own their storage and can safely feed an autograd-enabled LoRA.
+        """
+        if (state.ndim != 2 or state.shape[0] != 1
+                or x_t.shape != (1, self.config.n_action_steps, self.config.max_action_dim)
+                or timestep.shape != (1,)):
+            raise ValueError("Deployment-feature v1 requires B=1 and the deployed action chunk shape")
+        with frozen_deployment_mode(self, images, img_masks, lang_tokens, lang_masks,
+                                    state, x_t, timestep, image_grid_thw):
+            prefix_pad_masks, prefix_position_ids, past_key_values = self.prepare_velocity_prefix(
+                images, img_masks, lang_tokens, lang_masks, image_grid_thw=image_grid_thw,
+            )
+            hidden, velocity = self.predict_velocity_features(
+                state, prefix_pad_masks, past_key_values, x_t, timestep,
+                prefix_position_ids=prefix_position_ids,
+            )
+            validate_feature_outputs(hidden, velocity)
+            self._recap_feature_protocol = DEPLOYMENT_FEATURE_PROTOCOL
+            return hidden.clone(), velocity.clone()
+
+    def prepare_velocity_prefix(self, images, img_masks, lang_tokens, lang_masks, image_grid_thw=None):
+        """Build exactly the prefix cache used by sample_actions (no adapter)."""
+        (
+            prefix_embs,
+            prefix_pad_masks,
+            prefix_att_masks,
+            prefix_position_ids,
+            visual_pos_masks,
+            deepstack_visual_embeds,
+        ) = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, image_grid_thw=image_grid_thw,
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        _, past_key_values, _ = self.qwenvl_with_expert.forward(
+            attention_mask=prefix_att_2d_masks,
+            position_ids=prefix_position_ids,
+            vlm_position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=self.config.use_cache,
+            fill_kv_cache=True,
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_visual_embeds,
+        )
+        return prefix_pad_masks, prefix_position_ids, past_key_values
+
     def sample_actions(
         self,
         images,
@@ -1129,32 +1207,8 @@ class FlowMatchingV2(FlowMatchingV1):
             )
             noise = torch.randn(actions_shape, device=device, dtype=dtype)
 
-        (
-            prefix_embs,
-            prefix_pad_masks,
-            prefix_att_masks,
-            prefix_position_ids,
-            visual_pos_masks,
-            deepstack_visual_embeds,
-        ) = self.embed_prefix(
-            images,
-            img_masks,
-            lang_tokens,
-            lang_masks,
-            image_grid_thw=image_grid_thw,
-        )
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-
-        _, past_key_values, _ = self.qwenvl_with_expert.forward(
-            attention_mask=prefix_att_2d_masks,
-            position_ids=prefix_position_ids,
-            vlm_position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=self.config.use_cache,
-            fill_kv_cache=True,
-            visual_pos_masks=visual_pos_masks,
-            deepstack_visual_embeds=deepstack_visual_embeds,
+        prefix_pad_masks, prefix_position_ids, past_key_values = self.prepare_velocity_prefix(
+            images, img_masks, lang_tokens, lang_masks, image_grid_thw=image_grid_thw,
         )
 
         dt = torch.tensor(-1.0 / self.config.num_steps, dtype=dtype, device=device)
@@ -1213,6 +1267,17 @@ class FlowMatchingV2(FlowMatchingV1):
         recap_condition_id=None,
     ):
         """Predict velocity at time t using cached Qwen3-VL prefix states."""
+        hidden, velocity = self.predict_velocity_features(
+            state, prefix_pad_masks, past_key_values, x_t, timestep,
+            prefix_position_ids=prefix_position_ids, recap_condition_id=recap_condition_id,
+        )
+        return self._apply_recap_velocity_adapter(hidden, velocity, recap_condition_id)
+
+    def predict_velocity_features(
+        self, state, prefix_pad_masks, past_key_values, x_t, timestep,
+        prefix_position_ids=None, recap_condition_id=None,
+    ):
+        """Shared inference arithmetic up to (but excluding) the velocity adapter."""
         if prefix_position_ids is None:
             raise ValueError("FlowMatchingV2.predict_velocity requires Qwen3-VL prefix_position_ids.")
 
@@ -1271,9 +1336,7 @@ class FlowMatchingV2(FlowMatchingV1):
             if suffix_out.dtype != self.action_out_proj.weight.dtype:
                 suffix_out = suffix_out.to(self.action_out_proj.weight.dtype)
             v_t = self.action_out_proj(suffix_out)
-        return self._apply_recap_velocity_adapter(
-            suffix_out, v_t, recap_condition_id
-        )
+        return suffix_out, v_t
 
     def _moe_losses_and_metrics(self, router_logits_list, losses):
         router_z_loss_coeff = getattr(self.config, "router_z_loss_coeff", 0)
@@ -1533,6 +1596,8 @@ class LingbotVlaV2Policy(PreTrainedModel):
             + seq_wise_loss
             + router_z_loss
         )
+        if getattr(self.config, "recap_training_backend", "legacy") == "deployment" and not torch.isfinite(total_loss):
+            raise FloatingPointError("Nonfinite deployment-training total loss")
         loss_dict["router_z_loss"] = router_z_loss.detach() if torch.is_tensor(router_z_loss) else router_z_loss
         if moe_metrics:
             loss_dict.update(moe_metrics)

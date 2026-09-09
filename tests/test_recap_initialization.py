@@ -9,12 +9,13 @@ import torch
 from torch import nn
 
 from lingbotvla.recap.adapter import apply_recap_velocity_lora
+from lingbotvla.recap.initialization import initialize_velocity_lora_
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def small_adapter(adapter_type):
+def small_adapter(adapter_type, **config):
     path = ROOT / "lingbotvla/models/vla/lingbot_vla/modeling_lingbot_vla_v2.py"
     tree = ast.parse(path.read_text())
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "FlowMatchingV2")
@@ -26,11 +27,12 @@ def small_adapter(adapter_type):
     init = ast.parse("def initialize(self): pass").body[0]
     init.body = constructor.body[begin:end]
     reset = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "reset_recap_adapter")
-    scope = {"torch": torch, "nn": nn}
+    scope = {"torch": torch, "nn": nn, "initialize_velocity_lora_": initialize_velocity_lora_}
     exec(compile(ast.fix_missing_locations(ast.Module(body=[init, reset], type_ignores=[])), str(path), "exec"), scope)
     obj = nn.Module()
     obj.config = SimpleNamespace(recap_adapter_enabled=True, recap_adapter_type=adapter_type,
                                  recap_adapter_rank=2, proj_width=4, max_action_dim=3)
+    obj.config.__dict__.update(config)
     obj.reset_recap_adapter = MethodType(scope["reset_recap_adapter"], obj)
     scope["initialize"](obj)
     return obj

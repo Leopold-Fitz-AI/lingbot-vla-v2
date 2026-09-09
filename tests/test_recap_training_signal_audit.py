@@ -47,8 +47,8 @@ def test_distribution_summary_does_not_call_rows_independent_states():
     assert describe([50] * 13) == {"count": 13, "min": 50, "max": 50, "mean": 50, "median": 50}
 
 
-def test_actual_initializer_has_two_dominant_directions():
-    """Document the existing defect, not a claim that low rank causes every loss."""
+def test_legacy_initializer_has_two_dominant_directions():
+    """Legacy compatibility preserves this defect; new training opts into full rank."""
     import ast
     from pathlib import Path
     torch = pytest.importorskip("torch")
@@ -56,7 +56,8 @@ def test_actual_initializer_has_two_dominant_directions():
     tree = ast.parse(path.read_text())
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "FlowMatchingV2")
     fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "reset_recap_adapter")
-    namespace = {"torch": torch}
+    from lingbotvla.recap.initialization import initialize_velocity_lora_
+    namespace = {"torch": torch, "initialize_velocity_lora_": initialize_velocity_lora_}
     exec(compile(ast.Module(body=[fn], type_ignores=[]), str(path), "exec"), namespace)
     a, b = torch.empty(2, 8, 768), torch.empty(2, 55, 8)
     obj = SimpleNamespace(recap_adapter_enabled=True, recap_adapter_type="velocity_lora",

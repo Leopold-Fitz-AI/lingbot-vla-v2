@@ -301,7 +301,9 @@ class Qwen2TokenMoeBlock(nn.Module):
         routing_weights = routing_weights.to(hidden_states.dtype)
 
         # Expert computation: fused (group_gemm) or eager (per-expert loop)
+        used_backend = "eager"
         if self._moe_implementation == 'fused':
+            used_backend = "fused_bf16"
             use_robby_moe = (
                 robby_moe_forward is not None
                 and hidden_flat.is_cuda
@@ -322,6 +324,7 @@ class Qwen2TokenMoeBlock(nn.Module):
                             selected_experts.shape[1],
                         ),
                     )
+                    used_backend = "robby_deterministic" if torch.are_deterministic_algorithms_enabled() else "robby_atomic"
                 except Exception as exc:
                     if torch.are_deterministic_algorithms_enabled():
                         # The fallback also casts FP32 operands to BF16. A
@@ -357,6 +360,21 @@ class Qwen2TokenMoeBlock(nn.Module):
             ).float()  # (B*T, top_k, num_experts)
             weights = (expert_mask * routing_weights.unsqueeze(-1).float()).sum(dim=1).to(hidden_states.dtype)  # (B*T, num_experts)
             final_hidden_states = torch.einsum('ebd,be->bd', expert_outputs, weights)  # (B*T, D)
+
+        if getattr(self, "_recap_capture_backend", False):
+            # Opt-in diagnostic telemetry only. Input/parameter dtype does not
+            # claim IEEE-FP32 precision for every internal Triton GEMM.
+            self._recap_last_backend = {
+                "backend": used_backend,
+                "input_dtype": str(hidden_flat.dtype),
+                "routed_output_dtype": str(final_hidden_states.dtype),
+                "router_parameter_dtype": str(self.gate.weight.dtype),
+                "expert_parameter_dtype": str(next(self.experts.parameters()).dtype),
+                "device": str(hidden_flat.device),
+                "tokens": num_tokens,
+                "training": self.training,
+                "grad_enabled": torch.is_grad_enabled(),
+            }
 
         # Shared expert: applied to all tokens (fixed shape)
         if final_hidden_states.dtype != hidden_flat.dtype:

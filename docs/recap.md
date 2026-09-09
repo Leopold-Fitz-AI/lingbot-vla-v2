@@ -65,6 +65,10 @@ The [three-task training audit](recap_three_task_training_diagnosis_20260909.md)
 quantifies the sparse single-decision data, train/eval MoE precision mismatch,
 and nearly rank-two initialization; the [repair plan](recap_three_task_repair_plan.md)
 specifies controlled follow-up experiments without modifying the current final study.
+The opt-in [deployment-equivalent training repair](recap_training_repair_20260909.md)
+implements shared prefix/cache features and `orthogonal_matched_v1` initialization.
+Its full-model GPU parity gate must pass before claiming numerical equivalence or
+starting the planned retraining; CPU regression tests alone do not prove task gains.
 
 ## Label schema
 

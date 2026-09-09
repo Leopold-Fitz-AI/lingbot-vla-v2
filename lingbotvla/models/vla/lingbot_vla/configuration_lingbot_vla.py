@@ -98,6 +98,11 @@ class LingbotVLAConfig(PretrainedConfig):
         recap_adapter_rank: int = 8,
         recap_adapter_scale: float = 1.0,
         recap_adapter_init_std: float = 0.02,
+        recap_adapter_initialization: str = "legacy_sin_v1",
+        recap_adapter_init_seed: int = 0,
+        recap_training_backend: str = "legacy",
+        recap_prompt_enabled: bool = True,
+        enable_visual_distillation: bool = True,
         recap_signed_velocity_axis: bool = False,
         recap_residual_loss_weight: float = 0.0,
 
@@ -115,9 +120,14 @@ class LingbotVLAConfig(PretrainedConfig):
         self.recap_adapter_rank = recap_adapter_rank
         self.recap_adapter_scale = recap_adapter_scale
         self.recap_adapter_init_std = recap_adapter_init_std
+        self.recap_adapter_initialization = recap_adapter_initialization
+        self.recap_adapter_init_seed = recap_adapter_init_seed
+        self.recap_training_backend = recap_training_backend
+        self.recap_prompt_enabled = recap_prompt_enabled
+        self.enable_visual_distillation = enable_visual_distillation
         self.recap_signed_velocity_axis = recap_signed_velocity_axis
         self.recap_residual_loss_weight = recap_residual_loss_weight
-        self.use_cache = False
+        self.use_cache = recap_training_backend == "deployment"
         self.attention_implementation = attention_implementation
         self.num_steps = 10
         self.n_obs_steps = 1

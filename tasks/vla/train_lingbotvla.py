@@ -36,6 +36,7 @@ from lingbotvla.utils.async_hf_checkpoint import AsyncHFCheckpointSaver
 from lingbotvla.utils.arguments import EvalArguments, DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from lingbotvla.utils.dist_utils import all_reduce
 from lingbotvla.models.config_registry import get_config_registry
+from lingbotvla.recap.training import install_adapter_optimizer_guard, validate_deployment_training_arguments
 
 from lingbotvla.models.vla.vision_models.module_utils import (
     build_depth_model,
@@ -156,6 +157,18 @@ class MyTrainingArguments(TrainingArguments):
     recap_adapter_init_std: float = field(
         default=0.02,
         metadata={"help": "Initialization scale for the velocity LoRA down projection."},
+    )
+    recap_adapter_initialization: Literal["legacy_sin_v1", "orthogonal_matched_v1"] = field(
+        default="legacy_sin_v1",
+        metadata={"help": "Versioned A initialization; orthogonal_matched_v1 fixes the degenerate sine basis."},
+    )
+    recap_adapter_init_seed: int = field(
+        default=0,
+        metadata={"help": "Private CPU generator seed; does not consume the training RNG."},
+    )
+    recap_training_backend: Literal["legacy", "deployment"] = field(
+        default="legacy",
+        metadata={"help": "Opt-in single-device adapter training with the exact deployment feature path."},
     )
     recap_signed_velocity_axis: bool = field(
         default=False,
@@ -418,6 +431,7 @@ class Arguments:
 
 def main():
     args = parse_args(Arguments)
+    validate_deployment_training_arguments(args)
     logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
     logger.info_rank0(json.dumps(asdict(args), indent=2))
     torch.cuda.set_device(f"cuda:{args.train.local_rank}")
@@ -444,7 +458,8 @@ def main():
     )
 
     logger.info_rank0("Prepare model")
-    config_kwargs = {**vars(args.model), **vars(args.train)}
+    config_kwargs = {**vars(args.model), **vars(args.train),
+                     "recap_prompt_enabled": args.data.recap_prompt_enabled}
     config_registry = get_config_registry()
 
     config_key = args.model.config_key
@@ -466,12 +481,19 @@ def main():
         attn_implementation=args.model.attn_implementation,
         moe_implementation=getattr(args.model, 'moe_implementation', None),
     )
+    if args.train.recap_training_backend == "deployment":
+        # The policy constructor sets matmul precision to 'high'. Override AFTER
+        # construction; do not mistake FP32 parameter dtype for strict numerics.
+        torch.set_float32_matmul_precision("highest")
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.use_deterministic_algorithms(True, warn_only=False)
     if args.train.reset_recap_adapter:
         reset_adapter = getattr(getattr(model, "model", None), "reset_recap_adapter", None)
         if reset_adapter is None:
             raise ValueError("reset_recap_adapter requires a model with a RECAP adapter")
         reset_adapter()
-        logger.info_rank0("Zero-initialized the RECAP condition adapter after loading base weights.")
+        logger.info_rank0("Reset RECAP adapter to zero-residual behavior after loading base weights.")
 
     use_depth_align = bool(args.train.align_params) and args.train.enable_visual_distillation
     use_future_depth = use_depth_align and args.train.align_params.get('depth', {}).get('use_future_depth', False)
@@ -622,12 +644,17 @@ def main():
             param_groups=moe_param_groups,
         )
 
+    if args.train.recap_training_backend == "deployment":
+        install_adapter_optimizer_guard(optimizer, [p for p in model.parameters() if p.requires_grad])
+
     # Register loss-free load balancing hook (before optimizer.step).
     # The hook also all-reduces and snapshots
     # last_tokens_per_expert (the global load used for monitoring). Setting
     # bias_update_speed=0 makes the bias update a no-op (bias frozen at 0) while
     # keeping the global load monitoring intact.
-    if args.train.use_moe:
+    # Strict adapter training must not update ANY base buffer, including router
+    # corrections via an optimizer hook even when base parameters are frozen.
+    if args.train.use_moe and args.train.recap_training_backend != "deployment":
         _lb_hook = build_moe_load_balance_hook(
             model, coeff=args.train.bias_update_speed, bias_centering=args.train.bias_centering,
             update_interval=args.train.bias_update_interval,
