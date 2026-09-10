@@ -1,6 +1,16 @@
 # Confirmatory study completion tracking — 2026-09-09
 
-## Observed milestone (03:10 UTC)
+## Terminal update — 2026-09-10
+
+Complete: **6000 primary + 60 Negative**; terminal state `significant_uplift` at
+00:12 UTC, independent exact-reproduction and persistence audit passed at 00:19 UTC.
+Macro Null **92.8667%**, Positive **93.1333%**; **+0.2667 pp**, 95% CI
+**[0.1000, 0.4333] pp**, exact p **.0078125**, 8 improved / 0 regressed.
+Only click_bell was adapted; this does not establish repaired three-task gains or
+superiority to an official unmatched score. See [all 50 rows and guards](recap_final_result_20260910.md).
+The old controller/observer have exited. Do not restart or reuse final inputs for tuning.
+
+## Historical observed milestone (2026-09-09 03:10 UTC)
 
 Study: `jy:/dev/shm/recap_confirmatory_20260908_locked_cohorts`.
 The private controller remains unchanged (`57f8642` executable provenance).

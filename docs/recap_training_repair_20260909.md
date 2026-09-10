@@ -4,6 +4,13 @@
 **实现/CPU 测试通过不等于完整 6B GPU 对齐通过，更不等于成功率问题已经解决。**
 旧 base、adapter、当前确证 study 及其最终分析均不修改。
 
+## 2026-09-10 终端更新
+
+600-input GPU probe 已通过并归档；36-cell P0 重训及 1708-base-tensor 完整性审计
+随后全部完成。详见 [冻结设计、全部种子结果及证据位置](recap_training_ablation_20260910.md)。
+数值一致和谱退化修复已验证，但旧 holdout surrogate 无一致改善，三个任务成功率修复
+未被证明；没有自动启动 P1/P2 或修改生产 registry。下文执行状态保留为 9 月 9 日历史。
+
 ## 已实现
 
 ### 1. 部署一致的 adapter-only 训练路径

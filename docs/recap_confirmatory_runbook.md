@@ -1,6 +1,19 @@
 # Confirmatory study runbook
 
-## Latest milestone — 2026-09-09 03:10 UTC
+## Latest milestone — 2026-09-10
+
+The study is **complete**, with 6000 primary + 60 Negative episodes. Its terminal
+state `significant_uplift` and frozen statistics passed the independent completion
+audit and mirror read-back. Macro success: 92.8667% → 93.1333%, +0.2667 pp,
+95% CI [0.1000, 0.4333] pp, exact p .0078125. See [all 50 task results](recap_final_result_20260910.md).
+Controller and observer have exited; the continuation commands below are **historical,
+not a restart instruction**. No production promotion and no final-input reuse.
+
+The separate 600-input parity probe and 36-cell P0 training ablation also completed;
+[their audit and all-seed results](recap_training_ablation_20260910.md) do not establish
+three-task success-rate improvement. P1/P2 are not running or queued.
+
+## Historical milestone — 2026-09-09 03:10 UTC
 
 Screening (600) and independent confirmation (1200) have completed. Only
 `click_bell/v22_all` passed admission; the study-only registry is frozen.
