@@ -135,7 +135,7 @@ def timeline(path, left, right):
     plt.close(fig)
 
 
-def pack(study, out):
+def pack(study, out, *, render_storyboard=storyboard, render_timeline=timeline):
     if out.exists():
         raise FileExistsError("Never overwrite a review pack")
     arms = {t: {"positive": {}, "null": {}} for t in TASK_COUNTS}
@@ -186,8 +186,8 @@ def pack(study, out):
             for role in roles:
                 p, m = arms[task][role][seed]
                 rows.append(trajectory(p, m, evidence, expected))
-            storyboard(out / (case + ".png"), case, *rows)
-            timeline(out / (case + "_actions.png"), *rows)
+            render_storyboard(out / (case + ".png"), case, *rows)
+            render_timeline(out / (case + "_actions.png"), *rows)
             public[case] = {
                 "first_action_difference_decision": first_difference(*rows, "action"),
                 "first_observation_difference_decision": first_difference(*rows, "observation"),
