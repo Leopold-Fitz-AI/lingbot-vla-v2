@@ -28,6 +28,35 @@ IMAGE_KEYS = (
 VALID_LABELS = {-1, 0, 1}
 
 
+def parse_keep_labels(text: str | None) -> frozenset[int] | None:
+    """Parse a comma-separated label filter; None keeps every labeled decision."""
+
+    if text is None:
+        return None
+    labels = frozenset(int(item) for item in str(text).split(",") if item.strip())
+    if not labels:
+        raise ValueError("--keep-labels must select at least one label")
+    invalid = labels - VALID_LABELS
+    if invalid:
+        raise ValueError(
+            f"--keep-labels values must be in {sorted(VALID_LABELS)}, got {sorted(invalid)}"
+        )
+    return labels
+
+
+def expected_matched_keys(
+    labels: dict[tuple[str, int], dict[str, Any]],
+    keep_labels: frozenset[int] | None,
+) -> set[tuple[str, int]]:
+    """Label-map keys that must appear in the converted dataset."""
+
+    return {
+        key
+        for key, annotation in labels.items()
+        if keep_labels is None or annotation["recap_label"] in keep_labels
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rollout-dir", required=True)
@@ -39,6 +68,12 @@ def parse_args() -> argparse.Namespace:
         "--action-source",
         choices=("executed_action", "generated_action"),
         default="executed_action",
+    )
+    parser.add_argument(
+        "--keep-labels",
+        default=None,
+        help="Comma-separated recap_label values to convert (e.g. '1' for "
+        "positive-only); decisions with other labels are skipped.",
     )
     return parser.parse_args()
 
@@ -128,6 +163,60 @@ def _features(chunk_size: int) -> dict[str, dict[str, Any]]:
     return features
 
 
+_QUANTILE_KEYS = ("q01", "q10", "q50", "q90", "q99")
+
+
+def _flattened_stats(array: np.ndarray) -> dict[str, np.ndarray]:
+    """Per-dimension stats over all but the last axis (RunningQuantileStats form)."""
+
+    flat = np.asarray(array, dtype=np.float32).reshape(-1, array.shape[-1])
+    stats = {
+        "min": flat.min(axis=0),
+        "max": flat.max(axis=0),
+        "mean": flat.mean(axis=0),
+        "std": flat.std(axis=0),
+        "count": np.array([flat.shape[0]]),
+    }
+    for key in _QUANTILE_KEYS:
+        stats[key] = stats["mean"].copy()
+    return stats
+
+
+def install_consistent_episode_stats() -> None:
+    """Normalize single-frame episode stats for multi-dimensional features.
+
+    LeRobot's RunningQuantileStats flattens chunk features such as ``action``
+    over every axis but the last, so multi-frame episodes produce stats with
+    shape ``(action_dim,)``; single-frame episodes take a basic-stats path that
+    keeps the full ``(chunk_size, action_dim)`` shape. Aggregating the two forms
+    crashes ``aggregate_stats``. This wrapper rewrites single-frame stats into
+    the flattened form. Training never reads ``meta/stats.json`` (normalization
+    comes from ``norm_stats_file``), so only internal consistency matters.
+    """
+
+    from lerobot.datasets import lerobot_dataset as lerobot_dataset_module
+
+    original = lerobot_dataset_module.compute_episode_stats
+    if getattr(original, "_recap_consistent", False):
+        return
+
+    def compute_episode_stats_consistent(episode_data, features, *args, **kwargs):
+        stats = original(episode_data, features, *args, **kwargs)
+        for key, feature in features.items():
+            shape = tuple(feature.get("shape") or ())
+            if feature.get("dtype") in ("image", "video") or len(shape) <= 1:
+                continue
+            if key not in stats or key not in episode_data:
+                continue
+            data = np.asarray(episode_data[key])
+            if data.shape[0] < 2 and tuple(np.asarray(stats[key]["mean"]).shape) == shape:
+                stats[key] = _flattened_stats(data)
+        return stats
+
+    compute_episode_stats_consistent._recap_consistent = True
+    lerobot_dataset_module.compute_episode_stats = compute_episode_stats_consistent
+
+
 def convert(
     rollout_dir: str | Path,
     labels_path: str | Path,
@@ -136,6 +225,7 @@ def convert(
     repo_id: str,
     chunk_size: int,
     action_source: str,
+    keep_labels: frozenset[int] | None = None,
 ) -> dict[str, Any]:
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
@@ -156,6 +246,7 @@ def convert(
     try:
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
+        install_consistent_episode_stats()
         dataset = LeRobotDataset.create(
             repo_id=repo_id,
             fps=1,
@@ -184,12 +275,15 @@ def convert(
             if int(manifest.get("num_decisions", len(steps))) != len(steps):
                 raise ValueError(f"Episode {episode_id!r} num_decisions does not match steps")
 
+            episode_frames = 0
             for position, step in enumerate(steps):
                 decision_index = int(step.get("decision_index", position))
                 key = (episode_id, decision_index)
                 if key not in labels:
                     raise ValueError(f"Missing label for decision {key}")
                 annotation = labels[key]
+                if keep_labels is not None and annotation["recap_label"] not in keep_labels:
+                    continue
                 archive_path = manifest_path.parent / str(step["file"])
                 with np.load(archive_path, allow_pickle=False) as archive:
                     action, action_is_pad = pad_action_chunk(archive[action_source], chunk_size)
@@ -221,7 +315,11 @@ def convert(
                 matched.add(key)
                 label_counts[annotation["recap_label"]] += 1
                 decision_count += 1
+                episode_frames += 1
 
+            if episode_frames == 0:
+                # Filtered out entirely; LeRobot cannot save an empty episode.
+                continue
             dataset.save_episode()
             source = str(
                 (manifest.get("metadata") or {}).get("source", "online_recap_policy")
@@ -241,9 +339,11 @@ def convert(
                 }
             )
 
-        unmatched = sorted(set(labels) - matched)
+        unmatched = sorted(expected_matched_keys(labels, keep_labels) - matched)
         if unmatched:
             raise ValueError(f"{len(unmatched)} labels were not matched; first keys: {unmatched[:5]}")
+        if decision_count == 0:
+            raise ValueError("The keep-labels filter matched no rollout decisions")
         dataset.finalize()
 
         meta_dir = temporary / "meta"
@@ -257,6 +357,7 @@ def convert(
             "labels": str(Path(labels_path).expanduser().resolve()),
             "labels_sha256": labels_sha256,
             "action_source": action_source,
+            "keep_labels": None if keep_labels is None else sorted(keep_labels),
             "precomputed_action_chunks": True,
             "chunk_size": chunk_size,
             "episodes": len(episode_rows),
@@ -292,6 +393,7 @@ def main() -> None:
         repo_id=args.repo_id,
         chunk_size=args.chunk_size,
         action_source=args.action_source,
+        keep_labels=parse_keep_labels(args.keep_labels),
     )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
 

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Train the first RECAP state+task distributional value baseline."""
+"""Train a RECAP distributional value baseline from recorded rollouts.
+
+``--encoder state_task`` (default) is the proprio + task-id MLP.
+``--encoder visual_task`` encodes rollout cameras with a small conv net.
+"""
 
 from __future__ import annotations
 
@@ -18,11 +22,26 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from lingbotvla.recap.rollouts import load_decision_state, load_rollout_decisions  # noqa: E402
-from lingbotvla.recap.value import StateTaskValueModel, categorical_value_loss  # noqa: E402
+from lingbotvla.recap.rollouts import (  # noqa: E402
+    load_decision_images,
+    load_decision_state,
+    load_rollout_decisions,
+)
+from lingbotvla.recap.value import (  # noqa: E402
+    StateTaskValueModel,
+    VisualTaskValueModel,
+    VLMPooledValueModel,
+    categorical_value_loss,
+)
+from lingbotvla.recap.vlm_pool import load_vlm_embedding_cache, match_rollout_embeddings  # noqa: E402
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(
+    argv: list[str] | None = None,
+    *,
+    encoder_default: str = "state_task",
+    lock_encoder: bool = False,
+) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rollout-dir", required=True)
     parser.add_argument("--output", required=True, help="Value checkpoint path (.pt)")
@@ -34,6 +53,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-bins", type=int, default=201)
     parser.add_argument("--hidden-size", type=int, default=256)
     parser.add_argument("--task-embedding-dim", type=int, default=64)
+    if lock_encoder:
+        parser.set_defaults(encoder=encoder_default)
+    else:
+        parser.add_argument(
+            "--encoder",
+            choices=("state_task", "visual_task", "vlm_pooled"),
+            default=encoder_default,
+            help=(
+                "state_task is the proprio baseline; visual_task encodes rollout cameras; "
+                "vlm_pooled trains a categorical head on frozen VLM embeddings."
+            ),
+        )
+    parser.add_argument(
+        "--embedding-cache",
+        default=None,
+        help="Required for --encoder vlm_pooled. Cache from recap_cache_vlm_embeddings.py.",
+    )
+    parser.add_argument(
+        "--projector-hidden-size",
+        type=int,
+        default=None,
+        help="Optional MLP width on top of pooled VLM embeddings. Default: linear head only.",
+    )
+    parser.add_argument("--image-size", type=int, default=64)
+    parser.add_argument(
+        "--image-keys",
+        nargs="*",
+        default=None,
+        help="Optional explicit observation image keys. Default: every key containing 'image' or 'rgb'.",
+    )
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
@@ -53,7 +102,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or mps")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def _select_device(requested: str) -> torch.device:
@@ -110,8 +159,14 @@ def _split_episodes(
     return set(unique) - validation, validation
 
 
+def _model_logits(model, features, task_id):
+    if getattr(model, "uses_task_id", True):
+        return model(features, task_id)
+    return model(features)
+
+
 def _evaluate(
-    model: StateTaskValueModel,
+    model,
     loader: DataLoader,
     device: torch.device,
 ) -> tuple[float, float]:
@@ -119,21 +174,23 @@ def _evaluate(
     losses = []
     absolute_errors = []
     with torch.no_grad():
-        for state, task_id, returns in loader:
-            state = state.to(device)
+        for batch in loader:
+            features, task_id, returns = batch
+            features = features.to(device)
             task_id = task_id.to(device)
             returns = returns.to(device)
-            logits = model(state, task_id)
+            logits = _model_logits(model, features, task_id)
             loss = categorical_value_loss(logits, returns, model.value_support)
             prediction = model.value_head.expected_value_from_logits(logits)
-            losses.append(float(loss.item()) * state.shape[0])
+            losses.append(float(loss.item()) * features.shape[0])
             absolute_errors.append(float((prediction - returns).abs().sum().item()))
     denominator = max(len(loader.dataset), 1)
     return sum(losses) / denominator, sum(absolute_errors) / denominator
 
 
-def main() -> None:
-    args = parse_args()
+def main(args: argparse.Namespace | None = None) -> None:
+    if args is None:
+        args = parse_args()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
@@ -143,17 +200,39 @@ def main() -> None:
         failure_penalty=args.failure_penalty,
         gamma=args.gamma,
     )
-    states = [load_decision_state(decision, state_key=args.state_key) for decision in decisions]
-    state_dims = {state.shape[0] for state in states}
-    if len(state_dims) != 1:
-        raise ValueError(f"All states must have the same flattened dimension, got {sorted(state_dims)}")
-    state_dim = state_dims.pop()
-
     task_names = sorted({decision.task_name for decision in decisions})
     task_to_id = {task: index for index, task in enumerate(task_names)}
-    state_tensor = torch.from_numpy(np.stack(states)).float()
     task_tensor = torch.tensor([task_to_id[item.task_name] for item in decisions], dtype=torch.long)
     return_tensor = torch.tensor([item.empirical_return for item in decisions], dtype=torch.float32)
+    image_keys = list(args.image_keys) if args.image_keys else None
+    state_mean = None
+    state_std = None
+    state_dim = None
+    in_channels = None
+    vlm_hidden_size = None
+    if args.encoder == "vlm_pooled":
+        if not args.embedding_cache:
+            raise ValueError("--encoder vlm_pooled requires --embedding-cache")
+        cache = load_vlm_embedding_cache(args.embedding_cache)
+        feature_tensor = match_rollout_embeddings(cache, decisions)
+        vlm_hidden_size = int(cache["hidden_size"])
+    elif args.encoder == "visual_task":
+        images = [
+            load_decision_images(decision, image_keys=image_keys, image_size=args.image_size)
+            for decision in decisions
+        ]
+        shapes = {tuple(image.shape) for image in images}
+        if len(shapes) != 1:
+            raise ValueError(f"All visual observations must share shape, got {sorted(shapes)}")
+        feature_tensor = torch.from_numpy(np.stack(images)).float()
+        in_channels = int(feature_tensor.shape[2])
+    else:
+        states = [load_decision_state(decision, state_key=args.state_key) for decision in decisions]
+        state_dims = {state.shape[0] for state in states}
+        if len(state_dims) != 1:
+            raise ValueError(f"All states must have the same flattened dimension, got {sorted(state_dims)}")
+        state_dim = state_dims.pop()
+        feature_tensor = torch.from_numpy(np.stack(states)).float()
     episode_success = {
         item.episode_id: bool(item.terminated and not item.truncated)
         for item in decisions
@@ -181,17 +260,18 @@ def main() -> None:
     if train_indices.numel() == 0:
         raise ValueError("Episode split produced no training decisions")
 
-    state_mean = state_tensor[train_indices].mean(dim=0)
-    state_std = state_tensor[train_indices].std(dim=0, unbiased=False).clamp(min=1e-6)
-    state_tensor = (state_tensor - state_mean) / state_std
+    if args.encoder == "state_task":
+        state_mean = feature_tensor[train_indices].mean(dim=0)
+        state_std = feature_tensor[train_indices].std(dim=0, unbiased=False).clamp(min=1e-6)
+        feature_tensor = (feature_tensor - state_mean) / state_std
 
     train_dataset = TensorDataset(
-        state_tensor[train_indices],
+        feature_tensor[train_indices],
         task_tensor[train_indices],
         return_tensor[train_indices],
     )
     validation_dataset = TensorDataset(
-        state_tensor[validation_indices],
+        feature_tensor[validation_indices],
         task_tensor[validation_indices],
         return_tensor[validation_indices],
     )
@@ -209,16 +289,41 @@ def main() -> None:
     )
 
     device = _select_device(args.device)
-    model_config = {
-        "state_dim": state_dim,
-        "num_tasks": len(task_to_id),
-        "hidden_size": args.hidden_size,
-        "task_embedding_dim": args.task_embedding_dim,
-        "num_bins": args.num_bins,
-        "value_min": args.value_min,
-        "value_max": args.value_max,
-    }
-    model = StateTaskValueModel(**model_config).to(device)
+    if args.encoder == "visual_task":
+        model_type = "visual_task_categorical_value"
+        model_config = {
+            "num_tasks": len(task_to_id),
+            "in_channels": in_channels,
+            "image_size": args.image_size,
+            "hidden_size": args.hidden_size,
+            "task_embedding_dim": args.task_embedding_dim,
+            "num_bins": args.num_bins,
+            "value_min": args.value_min,
+            "value_max": args.value_max,
+        }
+        model = VisualTaskValueModel(**model_config).to(device)
+    elif args.encoder == "vlm_pooled":
+        model_type = "vlm_pooled_categorical_value"
+        model_config = {
+            "hidden_size": vlm_hidden_size,
+            "projector_hidden_size": args.projector_hidden_size,
+            "num_bins": args.num_bins,
+            "value_min": args.value_min,
+            "value_max": args.value_max,
+        }
+        model = VLMPooledValueModel(**model_config).to(device)
+    else:
+        model_type = "state_task_categorical_value"
+        model_config = {
+            "state_dim": state_dim,
+            "num_tasks": len(task_to_id),
+            "hidden_size": args.hidden_size,
+            "task_embedding_dim": args.task_embedding_dim,
+            "num_bins": args.num_bins,
+            "value_min": args.value_min,
+            "value_max": args.value_max,
+        }
+        model = StateTaskValueModel(**model_config).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
@@ -239,12 +344,12 @@ def main() -> None:
     }
     for epoch in range(1, args.epochs + 1):
         model.train()
-        for state, task_id, returns in train_loader:
-            state = state.to(device)
+        for features, task_id, returns in train_loader:
+            features = features.to(device)
             task_id = task_id.to(device)
             returns = returns.to(device)
             optimizer.zero_grad(set_to_none=True)
-            logits = model(state, task_id)
+            logits = _model_logits(model, features, task_id)
             loss = categorical_value_loss(logits, returns, model.value_support)
             loss.backward()
             optimizer.step()
@@ -270,13 +375,16 @@ def main() -> None:
             best_metric = selection_metric
             checkpoint = {
                 "schema_version": 1,
-                "model_type": "state_task_categorical_value",
+                "model_type": model_type,
                 "model_config": model_config,
                 "model_state_dict": {key: value.detach().cpu() for key, value in model.state_dict().items()},
                 "task_to_id": task_to_id,
                 "state_key": args.state_key,
                 "state_mean": state_mean,
                 "state_std": state_std,
+                "image_size": args.image_size if args.encoder == "visual_task" else None,
+                "image_keys": image_keys,
+                "embedding_cache": args.embedding_cache,
                 "failure_penalty": args.failure_penalty,
                 "gamma": args.gamma,
                 "metrics": metrics,

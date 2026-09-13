@@ -6,10 +6,60 @@ from pathlib import Path
 import numpy as np
 
 from scripts.recap_rollouts_to_lerobot import (
+    _flattened_stats,
+    expected_matched_keys,
     load_labeled_decisions,
     pad_action_chunk,
+    parse_keep_labels,
     prepare_rgb_image,
 )
+
+
+class FlattenedStatsTest(unittest.TestCase):
+    def test_flattens_chunk_feature_to_per_dimension_stats(self):
+        array = np.arange(2 * 3 * 4, dtype=np.float32).reshape(2, 3, 4)
+        stats = _flattened_stats(array)
+        flat = array.reshape(-1, 4)
+        self.assertEqual(stats["mean"].shape, (4,))
+        np.testing.assert_allclose(stats["mean"], flat.mean(axis=0))
+        np.testing.assert_allclose(stats["std"], flat.std(axis=0))
+        np.testing.assert_array_equal(stats["count"], np.array([6]))
+        self.assertEqual(stats["q50"].shape, (4,))
+
+
+class KeepLabelsFilterTest(unittest.TestCase):
+    def test_none_keeps_everything(self):
+        self.assertIsNone(parse_keep_labels(None))
+
+    def test_parses_positive_only(self):
+        self.assertEqual(parse_keep_labels("1"), frozenset({1}))
+
+    def test_parses_multiple_labels(self):
+        self.assertEqual(parse_keep_labels("1, 0"), frozenset({0, 1}))
+
+    def test_rejects_unknown_labels(self):
+        with self.assertRaisesRegex(ValueError, "keep-labels"):
+            parse_keep_labels("1,2")
+
+    def test_rejects_empty_selection(self):
+        with self.assertRaisesRegex(ValueError, "keep-labels"):
+            parse_keep_labels(" , ")
+
+    def test_expected_keys_only_count_selected_labels(self):
+        labels = {
+            ("ep-a", 0): {"recap_label": 1},
+            ("ep-a", 1): {"recap_label": 0},
+            ("ep-b", 0): {"recap_label": -1},
+            ("ep-b", 1): {"recap_label": 1},
+        }
+        self.assertEqual(
+            expected_matched_keys(labels, None),
+            {("ep-a", 0), ("ep-a", 1), ("ep-b", 0), ("ep-b", 1)},
+        )
+        self.assertEqual(
+            expected_matched_keys(labels, frozenset({1})),
+            {("ep-a", 0), ("ep-b", 1)},
+        )
 
 
 class ActionChunkPaddingTest(unittest.TestCase):

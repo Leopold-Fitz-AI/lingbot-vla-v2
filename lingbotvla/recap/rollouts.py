@@ -156,6 +156,92 @@ def load_decision_state(
     return state
 
 
+def _is_image_key(name: str) -> bool:
+    lowered = str(name).lower()
+    return "image" in lowered or "rgb" in lowered
+
+
+def _hwc_or_chw_to_chw(array: np.ndarray) -> np.ndarray:
+    if array.ndim == 2:
+        array = array[:, :, None]
+    if array.ndim != 3:
+        raise ValueError(f"Image array must be HWC or CHW, got shape {array.shape}")
+    height, width, last = array.shape
+    first = array.shape[0]
+    channel_first = first in (1, 3, 4) and first < min(array.shape[1], array.shape[2])
+    if channel_first:
+        return np.asarray(array, dtype=np.float32)
+    return np.transpose(array, (2, 0, 1)).astype(np.float32)
+
+
+def _resize_chw(image: np.ndarray, image_size: int) -> np.ndarray:
+    _, height, width = image.shape
+    if height == image_size and width == image_size:
+        return image
+    row_index = (np.arange(image_size) * height / image_size).astype(np.int64)
+    col_index = (np.arange(image_size) * width / image_size).astype(np.int64)
+    return image[:, row_index][:, :, col_index]
+
+
+def load_decision_images(
+    decision: RolloutDecision,
+    *,
+    image_keys: list[str] | tuple[str, ...] | None = None,
+    image_size: int | None = 64,
+) -> np.ndarray:
+    """Load camera images as ``[V, C, H, W]`` float32 in ``[0, 1]``.
+
+    Keys are taken from the NPZ ``observation::`` arrays. By default every key
+    whose name contains ``image`` or ``rgb`` is used, sorted for stability.
+    """
+
+    with np.load(decision.observation_path, allow_pickle=False) as archive:
+        available = [name.removeprefix("observation::") for name in archive.files if name.startswith("observation::")]
+        if image_keys is None:
+            selected = [name for name in available if _is_image_key(name)]
+        else:
+            selected = [str(name) for name in image_keys]
+        if not selected:
+            raise KeyError(
+                f"No camera images in {decision.observation_path}; available arrays: {archive.files}"
+            )
+        selected = sorted(selected)
+        views = []
+        for key in selected:
+            archive_key = f"observation::{key}"
+            if archive_key not in archive.files:
+                raise KeyError(f"Image key {key!r} is absent from {decision.observation_path}")
+            image = _hwc_or_chw_to_chw(np.asarray(archive[archive_key]))
+            if image_size is not None:
+                if int(image_size) <= 0:
+                    raise ValueError(f"image_size must be positive, got {image_size}")
+                image = _resize_chw(image, int(image_size))
+            if image.max() > 1.0:
+                image = image / 255.0
+            image = np.clip(image, 0.0, 1.0)
+            if not np.isfinite(image).all():
+                raise ValueError(f"Non-finite image for {key!r} in {decision.observation_path}")
+            views.append(image)
+    stacked = np.stack(views, axis=0)
+    channel_counts = {view.shape[0] for view in views}
+    if len(channel_counts) != 1:
+        raise ValueError(f"Mixed image channel counts in {decision.observation_path}: {sorted(channel_counts)}")
+    return stacked.astype(np.float32, copy=False)
+
+
+def group_decisions_by_episode(
+    decisions: list[RolloutDecision],
+) -> dict[str, list[RolloutDecision]]:
+    """Group decisions by episode, preserving decision-index order."""
+
+    grouped: dict[str, list[RolloutDecision]] = {}
+    for decision in decisions:
+        grouped.setdefault(decision.episode_id, []).append(decision)
+    for episode_id, items in grouped.items():
+        grouped[episode_id] = sorted(items, key=lambda item: item.decision_index)
+    return grouped
+
+
 def decisions_to_json_episode(
     decisions: list[RolloutDecision],
     values: list[float] | np.ndarray,

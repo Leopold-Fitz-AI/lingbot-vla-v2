@@ -47,6 +47,62 @@ def expected_value_from_logits(logits: Tensor, value_support: Tensor) -> Tensor:
     return (torch.softmax(logits, dim=-1) * support).sum(dim=-1)
 
 
+def n_step_advantages(
+    rewards: Tensor,
+    values: Tensor,
+    *,
+    n: int,
+    gamma: float = 1.0,
+    terminated: Tensor | None = None,
+    valid_mask: Tensor | None = None,
+    durations: Tensor | None = None,
+    horizon_unit: str = "actions",
+) -> Tensor:
+    """Advantage ``G_t^{(n)} - V(o_t)`` with the original RECAP n-step return."""
+
+    from lingbotvla.recap.value import n_step_returns
+
+    returns = n_step_returns(
+        rewards,
+        values,
+        n=n,
+        gamma=gamma,
+        terminated=terminated,
+        valid_mask=valid_mask,
+        durations=durations,
+        horizon_unit=horizon_unit,
+    )
+    return compute_advantages(returns, values)
+
+
+def positive_quantile_threshold(
+    advantages: Tensor,
+    *,
+    positive_fraction: float = 0.3,
+    valid_mask: Tensor | None = None,
+) -> float:
+    """Threshold so about ``positive_fraction`` of valid advantages are positive.
+
+    Original RECAP binarizes with a task-wise cutoff that keeps roughly the top
+    30% of advantages. ``torch.quantile`` interpolation is part of the contract.
+    """
+
+    if not 0.0 < float(positive_fraction) <= 1.0:
+        raise ValueError(f"positive_fraction must be in (0, 1], got {positive_fraction}")
+    if valid_mask is None:
+        selected = advantages.reshape(-1)
+    else:
+        if valid_mask.shape != advantages.shape:
+            raise ValueError("valid_mask must match advantages shape")
+        selected = advantages.reshape(-1)[valid_mask.reshape(-1).to(dtype=torch.bool)]
+    if selected.numel() == 0:
+        raise ValueError("positive_quantile_threshold requires at least one valid advantage")
+    if not torch.isfinite(selected).all():
+        raise ValueError("advantages contains NaN or infinity")
+    quantile = 1.0 - float(positive_fraction)
+    return float(torch.quantile(selected.float(), quantile).item())
+
+
 def compute_advantages(returns: Tensor, values: Tensor) -> Tensor:
     if returns.shape != values.shape:
         raise ValueError(

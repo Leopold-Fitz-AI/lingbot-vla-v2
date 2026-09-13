@@ -5,6 +5,10 @@ RECAP (RL with Experience and Corrections via Advantage-conditioned Policies)
 keeps the existing flow-matching policy objective and conditions it on whether
 a behavior-policy action has positive or negative advantage.
 
+This is a Recap **variant on LingBot-VLA 2.0**, not a clone of Physical
+Intelligence π0.6 and not a full π*0.6 reproduction. Architecture comparison:
+[recap_vs_pi06.md](recap_vs_pi06.md).
+
 ## Current implementation status
 
 Implemented:
@@ -16,18 +20,22 @@ Implemented:
 - per-sample condition dropout for the unconditional policy branch;
 - backward compatibility for legacy expert datasets;
 - categorical distributional value-head/loss primitives with 201 bins by default;
-- time-to-success rewards, Monte-Carlo returns, advantages, and ternary labels;
-- an offline JSONL labeling utility;
+- time-to-success rewards, Monte-Carlo returns, n-step advantages, and ternary labels;
+- per-task positive-quantile labeling and forced-positive teleop interventions;
+- an offline JSONL labeling utility that also reads rollout directories and
+  scores them with a value checkpoint (cameras loaded for visual-task critics);
 - dependency-light RoboTwin rollout recording with exact generated/executed action lengths;
-- an independently trainable state+task categorical value baseline and predictor;
+- independently trainable state+task, visual-task (camera CNN via
+  ``scripts/recap_visual_value.py``), and VLM-pooled categorical critics;
 - deployment defaults to the positive branch and permits per-observation overrides;
 - optional positive-vs-null CFG that combines velocities at every flow denoising step;
 - atomic attachment of labeled episode/frame indices to cloned LeRobot Parquet datasets.
 
 Still required before claiming task-suite-wide RECAP:
 
-- a visual-language value encoder, or simulator interventions at every relevant
-  decision, to estimate advantage where vision is required;
+- a **trainable smaller VLM** critic in the policy family (the shipped
+  `VLMPooledValueModel` attaches a categorical head to a *frozen* LingBot
+  prefix; it is not π*0.6's separately trained 670M-scale VLM);
 - repeated counterfactual collection/training rounds across tasks;
 - held-out evaluation on all target tasks, not only the `click_bell` diagnosis
   described below.
@@ -308,6 +316,91 @@ python tasks/vla/train_recap_value.py \
   --value-max 0
 ```
 
+The visual-task encoder reads rollout cameras (`observation.images.*`) instead
+of joint state. It is still a small conv net, not a frozen LingBot VLM.
+``scripts/recap_visual_value.py`` is the locked entry (same flags, no
+``--encoder``):
+
+```bash
+python scripts/recap_visual_value.py \
+  --rollout-dir /path/to/recap_rollouts \
+  --output output/recap_visual_value.pt \
+  --image-size 64 \
+  --failure-penalty 1000 \
+  --value-min -2000 \
+  --value-max 0
+```
+
+``tasks/vla/train_recap_value.py --encoder visual_task`` remains equivalent.
+
+`scripts/recap_predict_values.py` still emits value JSONL. Labeling can skip
+that step and read the rollout directory directly; visual-task checkpoints load
+camera NPZs from each decision:
+
+```bash
+python scripts/recap_label_rollouts.py \
+  --input /path/to/recap_rollouts \
+  --checkpoint output/recap_value.pt \
+  --output output/rollouts_labeled.jsonl \
+  --n-step 50 \
+  --n-step-unit actions \
+  --positive-fraction 0.3
+```
+
+JSONL from ``recap_predict_values.py`` is still accepted as ``--input``.
+`--n-step-unit actions` (default) accumulates `executed_action_length` so
+`n=50` is the paper's 50-step action horizon, not 50 policy chunks.
+`--n-step-unit decisions` counts JSONL/decision rows. Discounting always uses
+chunk duration.
+
+Intervention steps in the JSONL (`"intervention": true`) are forced positive.
+
+The VLM-pooled critic is a categorical head on frozen prefix embeddings
+(`p(V | o_t, ℓ)`). The production path loads the frozen policy checkpoint,
+replicates deployment preprocessing (`resize_image` + null-condition
+`FeatureTransform.apply(policy_eval=True)`) for every recorded decision, runs
+`encode_policy_prefix_hidden`, and writes an atomic cache:
+
+```bash
+python scripts/recap_cache_vlm_embeddings.py \
+  --rollout-dir /path/to/recap_rollouts \
+  --output output/vlm_embeddings.pt \
+  --policy-checkpoint /path/to/checkpoint \
+  --robot-config configs/robot_configs/robotwin.yaml \
+  --batch-size 8
+```
+
+Tests and custom encoders can still inject an encoder; train only the head
+after caching:
+
+```python
+from lingbotvla.recap.vlm_pool import encode_policy_prefix_hidden
+from lingbotvla.recap.value import masked_mean_pool
+from scripts.recap_cache_vlm_embeddings import cache_rollout_embeddings
+
+def encode_fn(decision):
+    hidden, mask = encode_policy_prefix_hidden(
+        flow_model, images, img_masks, lang_tokens, lang_masks, image_grid_thw
+    )
+    return hidden, mask
+
+cache_rollout_embeddings(rollout_dir, "output/vlm_embeddings.pt", encode_fn)
+```
+
+```bash
+python tasks/vla/train_recap_value.py \
+  --rollout-dir /path/to/recap_rollouts \
+  --output output/recap_vlm_value.pt \
+  --encoder vlm_pooled \
+  --embedding-cache output/vlm_embeddings.pt \
+  --failure-penalty 1000 \
+  --value-min -2000 \
+  --value-max 0
+```
+
+`FrozenVLMValueModel` wraps the same head around a frozen encoder for
+encode-on-the-fly training. Checkpoints store only the head.
+
 The train/validation split is performed by complete episode, never by frame.
 The checkpoint includes state normalization, the task vocabulary, return
 settings, and the best distributional model. Generate value-annotated episode
@@ -350,10 +443,11 @@ receive `0`, and failed terminal actions receive `-failure-penalty`. For
 `gamma < 1`, both within-chunk and between-chunk discounting use the true
 executed duration.
 
-This baseline validates the collection/value/labeling loop, but it cannot infer
-visual progress that is absent from joint state. It should not be presented as
-the final RECAP value model; the next version must pool the VLM observation and
-task representation.
+The state+task baseline cannot infer visual progress that is absent from joint
+state. The visual-task CNN can see cameras but does not share the policy VLM.
+`VLMPooledValueModel` is the frozen-VLM critic: it pools prefix hidden states
+and trains only `CategoricalValueHead`. It is still not π*0.6's separately
+trained smaller VLM.
 
 ## Deployment
 

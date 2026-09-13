@@ -6,13 +6,17 @@ from lingbotvla.recap.labels import (
     RecapAdvantageLabel,
     compute_advantages,
     label_advantages,
+    n_step_advantages,
+    positive_quantile_threshold,
     time_to_success_rewards,
 )
 from lingbotvla.recap.value import (
     CategoricalValueHead,
+    VisualTaskValueModel,
     categorical_value_loss,
     discretize_returns,
     monte_carlo_returns,
+    n_step_returns,
 )
 from scripts.recap_label_rollouts import label_episode
 from tasks.vla.train_recap_value import _split_episodes
@@ -172,6 +176,184 @@ class RolloutLabelingTest(unittest.TestCase):
             [step["recap_label"] for step in labeled["steps"]],
             [int(RecapAdvantageLabel.POSITIVE)] * 2,
         )
+
+
+class NStepReturnTest(unittest.TestCase):
+    def test_one_step_bootstraps_the_next_value(self):
+        rewards = torch.tensor([[1.0, 2.0, 3.0]])
+        values = torch.tensor([[10.0, 20.0, 30.0]])
+        returns = n_step_returns(rewards, values, n=1, gamma=1.0)
+        self.assertTrue(torch.allclose(returns, torch.tensor([[21.0, 32.0, 3.0]])))
+
+    def test_two_step_return_matches_paper_formula(self):
+        rewards = torch.tensor([1.0, 2.0, 3.0])
+        values = torch.tensor([10.0, 20.0, 30.0])
+        returns = n_step_returns(rewards, values, n=2, gamma=1.0)
+        self.assertTrue(torch.allclose(returns, torch.tensor([1.0 + 2.0 + 30.0, 2.0 + 3.0, 3.0])))
+
+    def test_gamma_discounts_bootstrap_and_intermediate_reward(self):
+        rewards = torch.tensor([1.0, 2.0, 3.0])
+        values = torch.tensor([0.0, 4.0, 0.0])
+        returns = n_step_returns(rewards, values, n=2, gamma=0.5)
+        self.assertTrue(torch.allclose(returns, torch.tensor([1.0 + 0.5 * 2.0 + 0.25 * 0.0, 2.0 + 0.5 * 3.0, 3.0])))
+
+    def test_termination_cuts_bootstrap(self):
+        rewards = torch.tensor([1.0, 2.0, 99.0])
+        values = torch.tensor([0.0, 50.0, 0.0])
+        terminated = torch.tensor([False, True, False])
+        returns = n_step_returns(rewards, values, n=2, terminated=terminated)
+        self.assertTrue(torch.allclose(returns, torch.tensor([1.0 + 2.0, 2.0, 99.0])))
+
+    def test_durations_scale_the_discount(self):
+        rewards = torch.tensor([1.0, 2.0])
+        values = torch.tensor([0.0, 10.0])
+        durations = torch.tensor([2, 1])
+        returns = n_step_returns(rewards, values, n=1, gamma=0.5, durations=durations)
+        self.assertTrue(torch.allclose(returns, torch.tensor([1.0 + 0.25 * 10.0, 2.0])))
+
+    def test_n_step_advantage_subtracts_current_value(self):
+        rewards = torch.tensor([1.0, 2.0, 3.0])
+        values = torch.tensor([10.0, 20.0, 30.0])
+        advantages = n_step_advantages(rewards, values, n=1)
+        self.assertTrue(torch.allclose(advantages, torch.tensor([11.0, 12.0, -27.0])))
+
+    def test_action_horizon_spans_chunks_until_n_actions(self):
+        rewards = torch.tensor([1.0, 2.0, 3.0])
+        values = torch.tensor([10.0, 20.0, 30.0])
+        durations = torch.tensor([30.0, 30.0, 10.0])
+        returns = n_step_returns(
+            rewards,
+            values,
+            n=50,
+            durations=durations,
+            horizon_unit="actions",
+        )
+        self.assertTrue(torch.allclose(returns, torch.tensor([1.0 + 2.0 + 30.0, 2.0 + 3.0, 3.0])))
+
+    def test_action_horizon_stops_after_one_full_chunk(self):
+        rewards = torch.tensor([1.0, 2.0])
+        values = torch.tensor([0.0, 10.0])
+        durations = torch.tensor([50.0, 10.0])
+        returns = n_step_returns(
+            rewards,
+            values,
+            n=50,
+            gamma=0.5,
+            durations=durations,
+            horizon_unit="actions",
+        )
+        self.assertTrue(torch.allclose(returns, torch.tensor([1.0 + (0.5**50) * 10.0, 2.0])))
+
+    def test_decision_horizon_ignores_action_durations_for_span(self):
+        rewards = torch.tensor([1.0, 2.0, 3.0])
+        values = torch.tensor([10.0, 20.0, 30.0])
+        durations = torch.tensor([30.0, 30.0, 10.0])
+        returns = n_step_returns(
+            rewards,
+            values,
+            n=1,
+            durations=durations,
+            horizon_unit="decisions",
+        )
+        self.assertTrue(torch.allclose(returns, torch.tensor([1.0 + 20.0, 2.0 + 30.0, 3.0])))
+
+
+class QuantileThresholdTest(unittest.TestCase):
+    def test_positive_quantile_keeps_the_requested_mass(self):
+        advantages = torch.tensor([-2.0, -1.0, 0.0, 1.0, 2.0, 3.0])
+        threshold = positive_quantile_threshold(advantages, positive_fraction=0.5)
+        labels = label_advantages(advantages, threshold=threshold)
+        self.assertEqual(int((labels == RecapAdvantageLabel.POSITIVE).sum()), 3)
+
+
+class VisualTaskValueTest(unittest.TestCase):
+    def test_visual_model_maps_cameras_and_task_to_value_bins(self):
+        model = VisualTaskValueModel(
+            num_tasks=2,
+            in_channels=3,
+            image_size=8,
+            hidden_size=16,
+            task_embedding_dim=4,
+            num_bins=5,
+            value_min=-4,
+            value_max=0,
+        )
+        images = torch.zeros(2, 2, 3, 8, 8)
+        images[1] = 1.0
+        logits = model(images, torch.tensor([0, 1]))
+        self.assertEqual(tuple(logits.shape), (2, 5))
+        self.assertEqual(tuple(model.expected_value(images, torch.tensor([0, 1])).shape), (2,))
+        loss = categorical_value_loss(
+            logits,
+            torch.tensor([-2.0, 0.0]),
+            model.value_support,
+        )
+        loss.backward()
+        self.assertTrue(any(parameter.grad is not None for parameter in model.parameters()))
+
+
+class InterventionAndNStepLabelTest(unittest.TestCase):
+    def test_n_step_labels_use_bootstrapped_advantage(self):
+        episode = {
+            "episode_id": "demo/n-step",
+            "task": "pick cup",
+            "success": True,
+            "steps": [
+                {"value": 0.0, "reward": -1.0, "terminated": False},
+                {"value": -1.0, "reward": 0.0, "terminated": True},
+            ],
+        }
+        labeled = label_episode(episode, n_step=1)
+        self.assertAlmostEqual(labeled["steps"][0]["recap_advantage"], -2.0)
+        self.assertEqual(labeled["steps"][0]["recap_label"], int(RecapAdvantageLabel.NEGATIVE))
+        self.assertAlmostEqual(labeled["steps"][1]["recap_advantage"], 1.0)
+        self.assertEqual(labeled["steps"][1]["recap_label"], int(RecapAdvantageLabel.POSITIVE))
+
+    def test_action_horizon_labels_span_executed_action_lengths(self):
+        episode = {
+            "episode_id": "demo/chunks",
+            "task": "pick cup",
+            "success": True,
+            "steps": [
+                {
+                    "value": 0.0,
+                    "reward": -30.0,
+                    "terminated": False,
+                    "executed_action_length": 30,
+                },
+                {
+                    "value": -10.0,
+                    "reward": -20.0,
+                    "terminated": False,
+                    "executed_action_length": 30,
+                },
+                {
+                    "value": 0.0,
+                    "reward": 0.0,
+                    "terminated": True,
+                    "executed_action_length": 10,
+                },
+            ],
+        }
+        labeled = label_episode(episode, n_step=50, n_step_unit="actions")
+        self.assertAlmostEqual(labeled["steps"][0]["recap_advantage"], -50.0)
+        self.assertEqual(labeled["steps"][0]["recap_label"], int(RecapAdvantageLabel.NEGATIVE))
+        self.assertAlmostEqual(labeled["steps"][1]["recap_advantage"], -10.0)
+        self.assertEqual(labeled["steps"][1]["recap_label"], int(RecapAdvantageLabel.NEGATIVE))
+
+    def test_intervention_steps_are_forced_positive(self):
+        episode = {
+            "episode_id": "demo/intervene",
+            "task": "pick cup",
+            "success": False,
+            "steps": [
+                {"value": 0.0, "reward": -1.0, "terminated": False, "intervention": True},
+                {"value": 0.0, "reward": -1000.0, "terminated": True},
+            ],
+        }
+        labeled = label_episode(episode, failure_penalty=1000)
+        self.assertEqual(labeled["steps"][0]["recap_label"], int(RecapAdvantageLabel.POSITIVE))
+        self.assertEqual(labeled["steps"][1]["recap_label"], int(RecapAdvantageLabel.NEGATIVE))
 
 
 class AdvantageLabelTest(unittest.TestCase):
