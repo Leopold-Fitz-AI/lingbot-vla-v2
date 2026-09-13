@@ -9,6 +9,9 @@ This is a Recap **variant on LingBot-VLA 2.0**, not a clone of Physical
 Intelligence π0.6 and not a full π*0.6 reproduction. Architecture comparison:
 [recap_vs_pi06.md](recap_vs_pi06.md).
 
+Round-1 value-conditioned adapter study (2026-09-13): valid **null result** —
+see [recap_value_adapter_round1_20260913.md](recap_value_adapter_round1_20260913.md).
+
 ## Current implementation status
 
 Implemented:
